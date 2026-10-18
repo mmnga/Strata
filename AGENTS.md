@@ -34,3 +34,24 @@ offers the same steps as tools.
   [docs/COMMUNITY_BENCHMARKS.md](docs/COMMUNITY_BENCHMARKS.md), compare against a same-day run of the build you are
   testing, and say what you did not test.
 - Open test requests and the hardware that is wanted are listed in [docs/TEST_REQUESTS.md](docs/TEST_REQUESTS.md).
+
+## Publishing adopted DeepSeek changes
+
+- The user's destination is `https://github.com/mmnga/Strata`, branch `deepseek`.
+  After adopting and committing a validated improvement, push this branch to
+  `origin` without asking again. Do not push a candidate before its adoption.
+- Publish implementation, relevant tests, the portable server example and its
+  documentation. Keep models, binaries, tokenizer exports, profiler output,
+  runtime logs, experiment notebooks/images/prompts, trial configurations,
+  API keys and machine-specific paths local. Preserve existing local records.
+- Before pushing, fetch the remote branch and inspect every outgoing commit,
+  including files later deleted. A cleanup commit does not remove a secret or
+  generated artifact from earlier history. Keep local-only history in a local
+  reference; do not publish it with `--all`, `--mirror`, tags or a force push.
+- Enable the repository guard with `git config core.hooksPath .githooks` when
+  there is no existing hook configuration to preserve. Run
+  `python3 tools/deepseek41/check_push.py`, then
+  `git push --set-upstream origin deepseek`. The guard checks the destination,
+  outgoing paths and blobs; review its allowlist before extending the scope.
+- Keep the deployed adopted server running while preparing a publication.
+  Documentation and Git-only changes do not require another throughput run.

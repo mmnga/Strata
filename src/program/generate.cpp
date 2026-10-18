@@ -91,6 +91,9 @@
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
 #endif
+#if defined(STRATA_HAVE_DEEPSEEK41)
+#include "strata/deepseek41/engine.hpp"
+#endif
 #if defined(_WIN32)
 #include <windows.h>
 #include <psapi.h>
@@ -2195,7 +2198,9 @@ int main(int argc, char** argv) {
         }
         // `strata --families`: the GGUF architectures this build runs (setup asks before it installs one)
         if (std::strcmp(argv[i], "--families") == 0) {
-#if defined(STRATA_HAVE_QWEN35)
+#if defined(STRATA_HAVE_DEEPSEEK41)
+            std::printf("qwen4exp qwen35moe deepseek41\n");
+#elif defined(STRATA_HAVE_QWEN35)
             std::printf("qwen4exp qwen35moe\n");
 #else
             std::printf("qwen4exp\n");
@@ -2249,20 +2254,31 @@ int main(int argc, char** argv) {
 #endif
         break;
     }
-#if defined(STRATA_HAVE_QWEN35)
+#if defined(STRATA_HAVE_QWEN35) || defined(STRATA_HAVE_DEEPSEEK41)
     // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) runs on its own engine path
     // (src/qwen35), decided here from the file's header before any of this engine's state exists; every other file
     // goes on below exactly as before.  Only the architecture string is read (the header of --native's shard).
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--native") != 0 && std::strcmp(argv[i], "--model") != 0) continue;
         bool qwen35 = false;
+        bool deepseek41 = false;
         try {
             const strata::GgufFile meta(strata::gguf_split_paths(argv[i + 1]).front());
             qwen35 = strata::model_family(meta) == strata::ModelFamily::Qwen35Moe;
+            deepseek41 = strata::model_family(meta) == strata::ModelFamily::DeepSeek41;
         } catch (const std::exception&) {
             // not readable here: the normal path below reports it
         }
+#if defined(STRATA_HAVE_DEEPSEEK41)
+        if (deepseek41) return strata::deepseek41::run(argc, argv);
+#else
+        (void)deepseek41;
+#endif
+#if defined(STRATA_HAVE_QWEN35)
         if (qwen35) return strata::qwen35::run(argc, argv);
+#else
+        (void)qwen35;
+#endif
         break;
     }
 #endif

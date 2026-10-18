@@ -31,6 +31,13 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 // graph capture; captured graphs keep the kernels they captured.
 void native_mmvq_set_multi_exact(bool exact);
 bool native_mmvq_multi_exact();
+// Native DeepSeek grouped output projection. Unchanged raw Q4_K/Q6_K matrices
+// [groups][n_out][n_in], x/y token-major with all groups contiguous per token.
+// x_q8_1 and optional x_il quantize the complete groups*n_in input. Reuses
+// the ordinary exact selector (interleaved at 2..4 columns, plain at 1/5..8).
+// CUDA only; no allocation or weight repacking, explicit stream.
+void native_mmvq_grouped(int type,const void* weights,const void* x_q8_1,const void* x_il,
+                         float* y,int n_in,int n_out,int groups,int ncols,void* stream);
 // B6 (lab, opt-in STRATA_B6_MMVQ_ROWS=1): the exact multi-column layout with the activation blocks of every column
 // loaded once per weight block and reused across the block's rows (bitwise the same sums as the default exact
 // layout). 0 = off (default), 1 = 2 rows per block, 2 / 4 / 8 = that many rows. Q4_K, Q5_K, Q6_K and IQ4_XS only.

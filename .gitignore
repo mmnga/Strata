@@ -64,3 +64,18 @@ build-vision-cuda12.bat
 
 # local Windows HIP packaging output
 dist-hip/
+
+# DeepSeek development artifacts stay local; publish the portable example instead.
+/trial/
+/runtime/
+/docs/DEEPSEEK41_EXPERIMENTS.md
+/docs/deepseek41-experiments/
+*.gguf
+*.safetensors
+.env
+.env.*
+*api-key*.txt
+*api_key*.txt
+*.key
+*.pem
+*.p12

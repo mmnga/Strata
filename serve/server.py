@@ -68,6 +68,7 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve.deepseek41 import DeepSeekTemplate, DeepSeekOutputParser, forced_prefix  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -2637,7 +2638,7 @@ def layer_split_value(cfg: dict) -> str:
 def layer_split_of(cfg: dict) -> bool:
     """Several GPUs in the config are a layer split, unless the args put the later card(s) to another use: with
     --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665)."""
-    return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
+    return cfg.get("arch") != "deepseek41" and len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -3186,8 +3187,15 @@ class Service:
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        if getattr(tokenizer, "pre", "") == "joyai-llm":
+            token_id = tokenizer.special_ids.get("tokenizer.ggml.eos_token_id",
+                                                 tokenizer.ids.get("<｜end▁of▁sentence｜>"))
+            if token_id is None:
+                raise ValueError("DeepSeek tokenizer is missing its end-of-sentence token")
+            self.stop_ids = {int(token_id)}
+        else:
+            self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
+                                tokenizer.encode("<|endoftext|>", parse_special=True))
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
         # encode in full.
@@ -3959,6 +3967,11 @@ class Service:
         prompt; with thinking, Service.run writes it once the thinking is over."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
+        if getattr(self.tok, "pre", "") == "joyai-llm":
+            ctk = (req or {}).get("chat_template_kwargs") or {}
+            explicit = ctk.get("enable_thinking") if isinstance(ctk, dict) else None
+            kwargs.setdefault("enable_thinking", explicit if isinstance(explicit, bool) else bool(kwargs.get("reasoning_effort")))
+            force = forced_prefix(force)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
@@ -4213,7 +4226,11 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        parser_type = OutputParser
+        if getattr(self.tok, "pre", "") == "joyai-llm":
+            parser_type = DeepSeekOutputParser
+            force = forced_prefix(force)
+        parser = parser_type(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -6772,7 +6789,7 @@ def check_request_sampling(req) -> None:
 
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
-FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b"}
+FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b", "deepseek41": "deepseek-v4.1-flash-1017"}
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
@@ -6872,7 +6889,9 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        tokenizer_config = json.loads((tpath / "tokenizer.json").read_text()) if (tpath / "tokenizer.json").exists() else {}
+        tok = ST.Tokenizer(tokens, merges, types, pre=tokenizer_config.get("pre", "qwen35"),
+                           special_ids=tokenizer_config.get("special_ids", {}))
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:
@@ -6944,7 +6963,9 @@ def main() -> int:
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    template_path = tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"
+    template = DeepSeekTemplate(template_path, tok) if getattr(tok, "pre", "") == "joyai-llm" else ChatTemplate(template_path)
+    svc = Service(engine, tok, template,
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)

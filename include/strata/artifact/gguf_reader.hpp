@@ -282,6 +282,7 @@ struct MetaValue {
     std::string s;                 // string payloads
     MetaType elem = MetaType::U32; // arrays
     uint64_t count = 0;
+    uint64_t array_offset = 0;     // payload in the owning GgufFile; items remains a bounded sample
     std::vector<MetaValue> items;
     bool is_num() const { return type != MetaType::STRING && type != MetaType::ARRAY; }
     double num() const { return (type == MetaType::F32 || type == MetaType::F64) ? f : (double)u; }
@@ -335,6 +336,7 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
+        v.array_offset = c.pos();
         v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
         for (uint64_t i = 0; i < v.count; ++i) {
             MetaValue e = read_value(c, v.elem, depth + 1);
@@ -382,6 +384,46 @@ public:
         return it == meta_.end() ? nullptr : &it->second;
     }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
+
+    /// Read an entire integer array on demand. metadata().items intentionally
+    /// keeps only64 entries; model tables such as Engram's token map need all
+    /// entries. Values are copied out, with no dependency on the mapping's life.
+    std::vector<uint64_t> integer_array(const std::string& key) const {
+        const MetaValue* v = get(key);
+        if (!v || v->type != MetaType::ARRAY)
+            throw std::runtime_error("GGUF: " + key + " is not an array");
+        switch (v->elem) {
+        case MetaType::U8: case MetaType::I8: case MetaType::U16: case MetaType::I16:
+        case MetaType::U32: case MetaType::I32: case MetaType::U64: case MetaType::I64:
+            break;
+        default: throw std::runtime_error("GGUF: " + key + " is not an integer array");
+        }
+        if (v->array_offset > size_) throw std::runtime_error("GGUF: array outside file: " + key);
+        Cursor c(base_ + v->array_offset, (size_t) (size_ - v->array_offset));
+        std::vector<uint64_t> result;
+        result.reserve((size_t) v->count);
+        const bool signed_type = v->elem == MetaType::I8 || v->elem == MetaType::I16 ||
+                                 v->elem == MetaType::I32 || v->elem == MetaType::I64;
+        for (uint64_t i = 0; i < v->count; ++i) {
+            const uint64_t n = read_value(c, v->elem).u;
+            if (signed_type && (int64_t) n < 0)
+                throw std::runtime_error("GGUF: negative integer in " + key);
+            result.push_back(n);
+        }
+        return result;
+    }
+
+    std::vector<double> real_array(const std::string& key) const {
+        const MetaValue* v = get(key);
+        if (!v || v->type != MetaType::ARRAY || (v->elem != MetaType::F32 && v->elem != MetaType::F64))
+            throw std::runtime_error("GGUF: " + key + " is not a floating-point array");
+        if (v->array_offset > size_) throw std::runtime_error("GGUF: array outside file: " + key);
+        Cursor c(base_ + v->array_offset, (size_t) (size_ - v->array_offset));
+        std::vector<double> result;
+        result.reserve((size_t) v->count);
+        for (uint64_t i = 0; i < v->count; ++i) result.push_back(read_value(c, v->elem).f);
+        return result;
+    }
 
 private:
     void open() {

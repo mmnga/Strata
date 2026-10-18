@@ -1,0 +1,3 @@
+#!/bin/sh
+# Validate all outgoing commits, including artifacts removed in later commits.
+exec python3 tools/deepseek41/check_push.py --pre-push "$@"

@@ -647,10 +647,15 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(40)
 #endif
 // Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them
-#ifdef STRATA_Q6K_EXPERTS
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40)
+#if defined(STRATA_NATIVE_DEEPSEEK41)
+#define STRATA_DS41_D_FMTS(X) X(12)
 #else
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40)
+#define STRATA_DS41_D_FMTS(X)
+#endif
+#ifdef STRATA_Q6K_EXPERTS
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40) STRATA_DS41_D_FMTS(X)
+#else
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) STRATA_DS41_D_FMTS(X)
 #endif
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
@@ -2133,6 +2138,20 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
         q8_1_store(h, hq, i);
     }
 }
+
+#if defined(STRATA_NATIVE_DEEPSEEK41)
+__global__ void __launch_bounds__(256) swiglu_clamp_q8_1_entries_kernel(
+    const float* __restrict__ gate, const float* __restrict__ up,
+    const int32_t* __restrict__ grp_start, const int32_t* __restrict__ n_groups,
+    int n_ff, float limit, block_q8_1* __restrict__ hq) {
+    const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
+    for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
+         i += (long long) gridDim.x * blockDim.x) {
+        const float g = fminf(gate[i], limit), u = fminf(fmaxf(up[i], -limit), limit);
+        q8_1_store(__fmul_rn(g / (1.0f + __expf(-g)), u), hq, i);
+    }
+}
+#endif
 
 // ---------------------------------------------------------------- dequant (dequantize.cuh)
 template<typename dst_t> __device__ __forceinline__ dst_t cvt(float v);
@@ -4251,10 +4270,17 @@ bool native_expert_expdec_takes(const NativeExpertLayout& L, bool& gu, bool& dow
     return gu || down;
 }
 
+#if defined(STRATA_NATIVE_DEEPSEEK41)
+static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                           const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
+                           int64_t grid_groups, float limit) {
+#else
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups) {
+#endif
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
     cudaStream_t s = (cudaStream_t) stream;
@@ -4402,6 +4428,12 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #else
     const bool sw_v1 = v1;
 #endif
+#if defined(STRATA_NATIVE_DEEPSEEK41)
+    if (limit > 0) {
+        swiglu_clamp_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(
+            gate, up, grp_start, n_groups, (int) L.n_ff, limit, hq);
+    } else
+#endif
     if (sw_v1) {
         swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
@@ -4448,5 +4480,18 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     check("native_expert_grouped/down");
 }
+
+#if defined(STRATA_NATIVE_DEEPSEEK41)
+void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* ptr, const int32_t* start,
+                           const int32_t* ng, const int32_t* dst, const int32_t* tok, int64_t cg, int64_t ce,
+                           const void* x, void* scratch, float* out, void* stream, int64_t grid) {
+    native_expert_grouped_impl(L, ptr, start, ng, dst, tok, cg, ce, x, scratch, out, stream, grid, 0);
+}
+void native_expert_grouped_clamp(const NativeExpertLayout& L, const unsigned long long* ptr, const int32_t* start,
+                                 const int32_t* ng, const int32_t* dst, const int32_t* tok, int64_t cg, int64_t ce,
+                                 const void* x, void* scratch, float* out, void* stream, float limit, int64_t grid) {
+    native_expert_grouped_impl(L, ptr, start, ng, dst, tok, cg, ce, x, scratch, out, stream, grid, limit);
+}
+#endif
 
 }  // namespace strata::kernels
