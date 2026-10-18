@@ -55,7 +55,8 @@
     "STRATA_DS41_MXFP4_ALU": "1",
     "STRATA_DS41_FFN_GRAPH": "1",
     "STRATA_DS41_SCORE_GRID": "1",
-    "STRATA_DS41_WIDE_IL": "1"
+    "STRATA_DS41_WIDE_IL": "1",
+    "STRATA_DS41_VALUE_HEAD_PAIR": "1"
   },
   "sampling": {
     "temperature": 0,

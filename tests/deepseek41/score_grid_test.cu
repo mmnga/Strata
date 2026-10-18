@@ -7,6 +7,7 @@
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <vector>
 namespace K = strata::deepseek41::cuda;
 void ck(cudaError_t e) { if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e)); }
@@ -35,7 +36,7 @@ struct Graph {
 };
 uint16_t half_bits(float v) { const auto h=__float2half_rn(v); uint16_t b; std::memcpy(&b,&h,2); return b; }
 
-void normalized_weights(cudaStream_t s,int tokens,int ratio,int first) {
+void normalized_weights(cudaStream_t s,int tokens,int ratio,int first,bool pair_heads) {
     constexpr int D=512,Heads=32,Window=128,Capacity=136,Top=512;
     auto qv=values(size_t(tokens)*D*Heads);Device<float> q(qv),sinks(values(Heads));
     Device<float> actual(q.n),expected(q.n),gridded(q.n);Device<uint8_t> scratch(size_t(tokens)*Heads*640*12);Device<int32_t> positions(tokens),ids(size_t(tokens)*Top);
@@ -52,7 +53,7 @@ void normalized_weights(cudaStream_t s,int tokens,int ratio,int first) {
         K::attention_positions_query_prefetch(q.p,raw.p,ratio ? comp.p : nullptr,ratio ? ids.p : nullptr,sinks.p,actual.p,scratch.p,
             D,Heads,tokens,Window,positions.p,ratio,ratio ? Top : 0,Top,Capacity,s,false);
         K::attention_positions_score_grid(q.p,raw.p,ratio ? comp.p : nullptr,ratio ? ids.p : nullptr,sinks.p,gridded.p,scratch.p,
-            D,Heads,tokens,Window,positions.p,ratio,ratio ? Top : 0,Top,Capacity,s);
+            D,Heads,tokens,Window,positions.p,ratio,ratio ? Top : 0,Top,Capacity,s,pair_heads);
     });
     for(int replay=0;replay<2;++replay) {
         const int start=std::min(first+replay,262144-tokens);
@@ -71,14 +72,16 @@ void normalized_weights(cudaStream_t s,int tokens,int ratio,int first) {
         exact(gridded.get(s),expected.get(s),"score grid changed original dot/whole-head softmax/FMA order");
     }
 }
-int main() {
+int main(int argc,char** argv) {
     try {
+        const bool pair_heads=argc==2 && std::string(argv[1])=="--pair-heads";
+        require(argc==1 || pair_heads,"expected optional --pair-heads");
         int devices=0;ck(cudaGetDeviceCount(&devices));require(devices>=2,"native attention test requires TP2 GPUs");
         for(int device=0;device<2;++device) {
             ck(cudaSetDevice(device));cudaStream_t s=nullptr;ck(cudaStreamCreateWithFlags(&s,cudaStreamNonBlocking));
             for(int tokens=1;tokens<=8;++tokens) for(int ratio:{0,1,2}) for(int first:{0,127,511,1023,262136})
-                normalized_weights(s,tokens,ratio,first);
-            ck(cudaStreamDestroy(s));std::cout<<"device="<<device<<" score-grid/original whole-head reductions bitwise PASS, D512/head32, NT1..8, ratios0/1/2, sink, ring wrap, full context, two changed graph replays\n";
+                normalized_weights(s,tokens,ratio,first,pair_heads);
+            ck(cudaStreamDestroy(s));std::cout<<"device="<<device<<" paired_value_heads="<<pair_heads<<" score-grid/original whole-head reductions bitwise PASS, D512/head32, NT1..8, ratios0/1/2, sink, ring wrap, full context, two changed graph replays\n";
         }
     } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}
 }

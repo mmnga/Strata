@@ -94,6 +94,11 @@ weight blocks, Q8 input bytes and per-column sums stay unchanged. The
 DSpark IL buffer is prepared before graph capture. CHECK disables this
 candidate throughout the reference prefix and serial steps. The example
 sets `STRATA_DS41_WIDE_IL=1`; the general default stays off.
+N32 stages two adjacent heads' probabilities and one shared KV row list,
+then reuses each exact FP16 value read for two independent row-ordered FMA
+recurrences. QK, full softmax and the existing persistent workspace stay
+unchanged. `STRATA_DS41_VALUE_HEAD_PAIR=1` requires the score-grid path;
+the default remains off and odd head counts are rejected only when enabled.
 Unadopted diagnostic paths remain disabled in the example.
 
 ## Validation and measured performance
@@ -102,8 +107,8 @@ The native tests cover metadata, HC, Engram hashing, routing, F16 ring and
 sparse attention, YaRN, stable indexing, original MXFP4, CPU row phases,
 cache leases, transfers, output projections and graph replay.
 The original-model serial-versus-batch8 and rejected-tail checks passed
-with bit-identical logits for N31. All six fixed-workload output sequences
-and acceptance counts for N31 matched N26. Python tests cover DeepSeek's tokenizer,
+with bit-identical logits for N32. All six fixed-workload output sequences
+and acceptance counts for N32 matched N31. Python tests cover DeepSeek's tokenizer,
 BOS/EOS, template, DSML tools and tool history. The N21 API checkpoint passed for English,
 Japanese, chat streaming, Responses, Anthropic Messages, tool calls/history,
 tool streaming, the web UI and authentication.
@@ -114,20 +119,20 @@ Host model residency was 409.518 GiB, in addition to GPU-resident weights.
 
 | Sequential workload | Output tokens | Decode tok/s |
 | --- | ---: | ---: |
-| Standard English | 1024 | 59.7466 |
-| Standard Japanese | 1024 | 58.6038 |
-| Held-out English | 1024 | 54.5891 |
-| Held-out Japanese | 1024 | 62.3381 |
-| Aggregate | 4096 | **58.6843** |
+| Standard English | 1024 | 60.0084 |
+| Standard Japanese | 1024 | 58.7634 |
+| Held-out English | 1024 | 54.7117 |
+| Held-out Japanese | 1024 | 62.5462 |
+| Aggregate | 4096 | **58.8690** |
 
-The aggregate is 4092 timed tokens divided by 69.7290 seconds of decode;
+The aggregate is 4092 timed tokens divided by 69.5103 seconds of decode;
 each request excludes its first output token from the timed count. It is
-0.20% faster than N26 on this fixed workload, with the same output IDs and
-acceptance counts. Three long cases improved; standard English was slightly
-slower. Adopt the highest measured aggregate without a statistical-confidence
-claim. All six model disk-read and major-fault deltas were zero; a live
-benchmark process and its two RAM lockers all had zero swap. The 70 tok/s
-target remains unmet.
+0.31% faster than N31 on this fixed workload, with the same output IDs and
+acceptance counts. All four long cases improved. Adopt this modest measured
+gain without a statistical-confidence claim. All six model disk-read and
+major-fault deltas were zero. The N31 live benchmark/locker snapshot had
+zero swap; an N32 live swap snapshot was not collected. Native pin/lock
+enforcement stays enabled. The 70 tok/s target remains unmet.
 The MXFP4 unit gate passed all 4096 scale/nibble pairs against an independent
 CPU exponent reference on each GPU, plus 48 bit-identical GU/Down graph
 replays at H5120/F2304, top3, NT1..8 (1.04 seconds).
@@ -145,6 +150,10 @@ zero rows, signed zeros, subnormal inputs and partial row groups. Q8 input
 bytes also matched. These operators were unchanged by the N31 allocation
 and original-prefix CHECK fixes; the real-model CHECK and fixed suite then
 passed with the DSpark graph enabled.
+The N32 adjacent-head value unit passed 240 shape cells and 480 bit-identical
+graph replays on both GPUs (1.40 seconds), including the original whole-head
+softmax and value FMA order, ring wrap, full-context positions, signed zeros
+and FP16 subnormals.
 These are workload-specific development measurements, not a speed guarantee
 for other prompts or hardware. Raw runs and generated result cards stay local.
 

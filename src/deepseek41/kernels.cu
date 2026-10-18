@@ -633,6 +633,35 @@ __global__ void attention_value_kernel(const float* weights,const unsigned long 
     }
 }
 
+// Every head of a token has the same raw/sparse row list. Share only its
+// pointer and exact half read; each head keeps its original probability and
+// sequential row-ordered FMA recurrence. Two heads retain128 tiles at NT1.
+__global__ void attention_value_head_pair_kernel(const float* weights,const unsigned long long* pointers,float* out,
+    int d,int heads,int window,const int32_t* positions,int ratio,int selected_limit,int stride) {
+    extern __shared__ __align__(16) unsigned char stage[];
+    auto* p0=reinterpret_cast<float*>(stage);
+    auto* p1=p0+stride;
+    auto* rows=reinterpret_cast<unsigned long long*>(p1+stride);
+    const int head=2*int(blockIdx.x),token=blockIdx.y,tid=threadIdx.x,dim=int(blockIdx.z)*64+tid;
+    const int pos=positions[token],first=max(0,pos-window+1);
+    const int n=pos-first+1+(ratio ? min((pos+1)/ratio,selected_limit) : 0);
+    const size_t slot=(size_t(token)*heads+head)*stride;
+    for(int row=tid;row<n;row+=64) {
+        p0[row]=weights[slot+row];p1[row]=weights[slot+stride+row];rows[row]=pointers[slot+row];
+    }
+    __syncthreads();
+    if(dim<d) {
+        float v0=0,v1=0;
+        for(int row=0;row<n;++row) {
+            const auto* value=reinterpret_cast<const uint16_t*>(rows[row]);
+            const float x=__half2float(__ushort_as_half(global_value_bits(value+dim)));
+            v0+=x*p0[row];v1+=x*p1[row];
+        }
+        out[(size_t(token)*heads+head)*d+dim]=v0;
+        out[(size_t(token)*heads+head+1)*d+dim]=v1;
+    }
+}
+
 }  // namespace
 
 void rms(const float* x,const float* w,float* y,int n,int rows,float eps,void* s) { rms_kernel<<<rows,threads,0,stream_cast(s)>>>(x,w,y,n,eps); }
@@ -803,9 +832,9 @@ void attention_positions_query_prefetch(const float* q,const uint16_t* raw,const
 }
 void attention_positions_score_grid(const float* q,const uint16_t* raw,const uint16_t* comp,const int32_t* ids,
     const float* sinks,float* out,void* scratch,int d,int heads,int tokens,int window,const int32_t* pos,
-    int ratio,int max_selected,int ids_stride,int raw_capacity,void* s) {
+    int ratio,int max_selected,int ids_stride,int raw_capacity,void* s,bool pair_heads) {
     if(d!=512 || heads<1 || tokens<1 || tokens>8 || window!=128 || raw_capacity<window+tokens ||
-       ratio<0 || ratio>2 || (max_selected!=0 && max_selected!=512) || (ratio && !comp) || !scratch)
+       ratio<0 || ratio>2 || (max_selected!=0 && max_selected!=512) || (ratio && !comp) || !scratch || (pair_heads && heads%2))
         throw std::invalid_argument("DeepSeek score-grid geometry");
     const int stride=window+max_selected;
     const size_t count=size_t(heads)*tokens*stride;
@@ -816,9 +845,15 @@ void attention_positions_score_grid(const float* q,const uint16_t* raw,const uin
         pos,ratio,max_selected,ids_stride,raw_capacity,stride);
     attention_score_softmax_kernel<<<dim3(heads,tokens),threads,size_t(stride)*4,stream_cast(s)>>>(weights,sinks,
         heads,window,pos,ratio,max_selected,stride);
-    const size_t shared=((size_t(stride)*4+7)&~size_t(7))+size_t(stride)*8;
-    attention_value_kernel<false,true><<<dim3(heads,tokens,8),64,shared,stream_cast(s)>>>(weights,rows,out,d,heads,
-        window,pos,ratio,max_selected,stride);
+    if(pair_heads) {
+        const size_t shared=size_t(stride)*(2*sizeof(float)+sizeof(unsigned long long));
+        attention_value_head_pair_kernel<<<dim3(heads/2,tokens,8),64,shared,stream_cast(s)>>>(weights,rows,out,d,heads,
+            window,pos,ratio,max_selected,stride);
+    } else {
+        const size_t shared=((size_t(stride)*4+7)&~size_t(7))+size_t(stride)*8;
+        attention_value_kernel<false,true><<<dim3(heads,tokens,8),64,shared,stream_cast(s)>>>(weights,rows,out,d,heads,
+            window,pos,ratio,max_selected,stride);
+    }
 }
 void top_k(float* scores,int32_t* ids,int rows,int k,void* s) {
     if (k < 0 || k > rows) throw std::invalid_argument("DeepSeek indexer top-k");
