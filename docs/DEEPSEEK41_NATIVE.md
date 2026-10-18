@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N26 settings. From the checkout root, copy it to an ignored local file:
+N40 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -99,6 +99,13 @@ then reuses each exact FP16 value read for two independent row-ordered FMA
 recurrences. QK, full softmax and the existing persistent workspace stay
 unchanged. `STRATA_DS41_VALUE_HEAD_PAIR=1` requires the score-grid path;
 the default remains off and odd head counts are rejected only when enabled.
+N40 reuses the accepted-window cache heat rule from the existing expert
+path: credit each retained expert once per window, decay heat every four
+windows, and track occurrence frequency separately with a 128-window decay.
+Only observed occurrences train admissions; predictions remain placement
+hints. Cache capacity, leases, pending-fill fences, replacement margin,
+raw weight copies and target arithmetic stay unchanged.
+`STRATA_DS41_WINDOW_HEAT=1` enables this rule; the general default stays off.
 Unadopted diagnostic paths remain disabled in the example.
 
 ## Validation and measured performance
@@ -119,20 +126,27 @@ Host model residency was 409.518 GiB, in addition to GPU-resident weights.
 
 | Sequential workload | Output tokens | Decode tok/s |
 | --- | ---: | ---: |
-| Standard English | 1024 | 60.0084 |
-| Standard Japanese | 1024 | 58.7634 |
-| Held-out English | 1024 | 54.7117 |
-| Held-out Japanese | 1024 | 62.5462 |
-| Aggregate | 4096 | **58.8690** |
+| Standard English | 1024 | 59.1552 |
+| Standard Japanese | 1024 | 63.0427 |
+| Held-out English | 1024 | 57.3685 |
+| Held-out Japanese | 1024 | 63.6764 |
+| Aggregate | 4096 | **60.6957** |
 
-The aggregate is 4092 timed tokens divided by 69.5103 seconds of decode;
+The aggregate is 4092 timed tokens divided by 67.4183 seconds of decode;
 each request excludes its first output token from the timed count. It is
-0.31% faster than N31 on this fixed workload, with the same output IDs and
-acceptance counts. All four long cases improved. Adopt this modest measured
-gain without a statistical-confidence claim. All six model disk-read and
-major-fault deltas were zero. The N31 live benchmark/locker snapshot had
-zero swap; an N32 live swap snapshot was not collected. Native pin/lock
-enforcement stays enabled. The 70 tok/s target remains unmet.
+3.10% faster than adopted N32 on the same fixed requests/order.
+Three long cases improved and standard English regressed. Cache placement
+changes the existing CPU/GPU expert mix; DSpark counts differ, and output
+IDs match N32 in 0 of six cases. This is an observed profile improvement,
+not an isolated kernel timing or a statistical-confidence claim.
+All six model disk-read and major-fault deltas were zero. The N40 live
+benchmark/main-plus-two-locker snapshot had zero swap, with residency
+enforcement enabled. Target math is unchanged from N32, so this metadata
+change did not repeat its target CHECK. Its independent metadata oracle
+passed 4000 accepted windows with 384 experts, repeated routes, retained
+lengths 0..8, both decays, saturation and invalid-prefix immutability.
+The 70 tok/s target remains unmet. The API checkpoint above remains N21;
+these throughput results do not establish a later API checkpoint.
 The MXFP4 unit gate passed all 4096 scale/nibble pairs against an independent
 CPU exponent reference on each GPU, plus 48 bit-identical GU/Down graph
 replays at H5120/F2304, top3, NT1..8 (1.04 seconds).

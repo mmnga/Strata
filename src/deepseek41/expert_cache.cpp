@@ -1,4 +1,6 @@
 #include "strata/deepseek41/expert_cache.hpp"
+#include "strata/deepseek41/window_heat.hpp"
+#include <cstdlib>
 #include "strata/core/expert_cache.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -28,12 +30,14 @@ struct ExpertCache::Impl {
         std::vector<Slot> slots;
         std::vector<int> lookup;
         std::vector<uint64_t> heat, age;
+        std::vector<uint32_t> frequency;
         uint64_t clock = 0;
     };
     std::vector<std::unique_ptr<Layer>> layers;
     std::vector<cudaStream_t> streams;
     std::atomic<uint64_t> hits{0}, queries{0}, fills{0}, bytes{0};
     int experts, devices;
+    bool window_heat=[] {const char* p=std::getenv("STRATA_DS41_WINDOW_HEAT");return p && std::atoi(p)!=0;}();
     Impl(const Model& m,const ResidentWeights& resident,int n,const std::vector<int>& budgets,int draft_reserve_mib) : experts(m.config().experts),devices(n) {
         const int count = m.config().layers;
         streams.resize(n);
@@ -43,8 +47,11 @@ struct ExpertCache::Impl {
             const auto p = "blk."+std::to_string(l)+".";
             c.gu = m.tensor(p+"ffn_gate_exps.weight").bytes()/size_t(experts); c.down = m.tensor(p+"ffn_down_exps.weight").bytes()/size_t(experts);
             c.g = resident.data(p+"ffn_gate_exps.weight"); c.u = resident.data(p+"ffn_up_exps.weight"); c.d = resident.data(p+"ffn_down_exps.weight");
-            c.lookup.assign(experts,-1); c.heat.assign(experts,0); c.age.assign(experts,0); layers.push_back(std::move(layer));
+            c.lookup.assign(experts,-1); c.heat.assign(experts,0); c.age.assign(experts,0);
+            if(window_heat) c.frequency.assign(experts,0);
+            layers.push_back(std::move(layer));
         }
+        if(window_heat) std::fprintf(stderr,"strata-deepseek41: accepted-window heat once/expert, decay4, frequency decay128, learned frequency>=2\n");
         for (int d = 0; d < n; ++d) {
             ck(cudaSetDevice(d)); size_t free = 0, total = 0; ck(cudaMemGetInfo(&free,&total));
             const size_t reserve = 1536*MiB+(d == n-1 ? size_t(draft_reserve_mib)*MiB : 0);
@@ -82,7 +89,8 @@ struct ExpertCache::Impl {
         if (l.slots.empty()) return;
         ck(cudaSetDevice(l.device));
         for (int e : ids) {
-            if (e < 0 || e >= experts || l.lookup[e] >= 0 || l.heat[e] < 512) continue;
+            if (e < 0 || e >= experts || l.lookup[e] >= 0 ||
+                (window_heat ? l.frequency[e]<2 : l.heat[e]<512)) continue;
             int victim = -1; uint64_t cold = UINT64_MAX, old = UINT64_MAX;
             for (size_t j = 0; j < l.slots.size(); ++j) {
                 auto& slot = l.slots[j];
@@ -123,7 +131,9 @@ void ExpertCache::release(int layer,const int32_t* ids,int count) {
     for (int j = 0; j < count; ++j) { const int i = l.lookup.at(size_t(ids[j])); if (i >= 0 && l.slots[size_t(i)].pins) --l.slots[size_t(i)].pins; }
 }
 void ExpertCache::observe(int layer,const int32_t* ids,int count) {
-    auto& l = *p_->layers.at(size_t(layer)); std::lock_guard<std::mutex> lock(l.mutex); ++l.clock;
+    auto& l = *p_->layers.at(size_t(layer)); std::lock_guard<std::mutex> lock(l.mutex);
+    if(p_->window_heat) {observe_window_heat(l.heat,l.age,l.frequency,l.clock,ids,count);return;}
+    ++l.clock;
     if (l.clock%128 == 0) for (auto& heat : l.heat) heat = heat*7/10;
     for (int j = 0; j < count; ++j) { const int e = ids[j]; if (e < 0 || e >= p_->experts) throw std::runtime_error("invalid observed expert ID"); l.heat[e] += 256; l.age[e] = l.clock; }
 }
