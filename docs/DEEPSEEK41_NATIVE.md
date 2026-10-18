@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N40 settings. From the checkout root, copy it to an ignored local file:
+N49 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -106,6 +106,12 @@ Only observed occurrences train admissions; predictions remain placement
 hints. Cache capacity, leases, pending-fill fences, replacement margin,
 raw weight copies and target arithmetic stay unchanged.
 `STRATA_DS41_WINDOW_HEAT=1` enables this rule; the general default stays off.
+N49 ports ExpertPool's idle-worker clock cadence to the native CPU flow:
+check the clock every 1024 pauses while continuing to check publication and
+stop every pause. The 20 ms condition-variable deadline, participants,
+affinity, task/completion protocol and arithmetic remain unchanged.
+`STRATA_DS41_POOL_CLOCK=1` enables it and requires MWAITX disabled;
+the default preserves the previous clock loop.
 Unadopted diagnostic paths remain disabled in the example.
 
 ## Validation and measured performance
@@ -126,25 +132,36 @@ Host model residency was 409.518 GiB, in addition to GPU-resident weights.
 
 | Sequential workload | Output tokens | Decode tok/s |
 | --- | ---: | ---: |
-| Standard English | 1024 | 59.1552 |
-| Standard Japanese | 1024 | 63.0427 |
-| Held-out English | 1024 | 57.3685 |
-| Held-out Japanese | 1024 | 63.6764 |
-| Aggregate | 4096 | **60.6957** |
+| Standard English | 1024 | 59.1976 |
+| Standard Japanese | 1024 | 63.1279 |
+| Held-out English | 1024 | 57.3926 |
+| Held-out Japanese | 1024 | 63.6879 |
+| Aggregate | 4096 | **60.7360** |
 
-The aggregate is 4092 timed tokens divided by 67.4183 seconds of decode;
-each request excludes its first output token from the timed count. It is
-3.10% faster than adopted N32 on the same fixed requests/order.
-Three long cases improved and standard English regressed. Cache placement
-changes the existing CPU/GPU expert mix; DSpark counts differ, and output
-IDs match N32 in 0 of six cases. This is an observed profile improvement,
-not an isolated kernel timing or a statistical-confidence claim.
-All six model disk-read and major-fault deltas were zero. The N40 live
-benchmark/main-plus-two-locker snapshot had zero swap, with residency
-enforcement enabled. Target math is unchanged from N32, so this metadata
-change did not repeat its target CHECK. Its independent metadata oracle
-passed 4000 accepted windows with 384 experts, repeated routes, retained
-lengths 0..8, both decays, saturation and invalid-prefix immutability.
+N49's aggregate is 4092 timed tokens divided by 67.3736 seconds of decode;
+each request excludes its first output token from the timed count. All four
+long cases were slightly faster than N40 (60.6957 tok/s, 67.4183 seconds).
+The difference is only 0.066%; this single changed-candidate suite does not
+establish statistical significance, and the timing difference may be noise.
+The profile is adopted for the small observed gain and verified reduction
+of idle clock work. All six output sequences and DSpark counts matched N40.
+Target and draft arithmetic, cache capacity and placement rules are unchanged.
+All six disk-read and major-fault deltas were zero. The N49 live snapshot
+of main plus two RAM lockers had zero swap, and 409.518 GiB residency was
+enforced after every request. Actual-model batch8 and rejected-tail CHECK
+had max_abs 0 and relative_rms 0 under the original 0.01 / 1e-4 limits.
+Both original-clock and enabled-clock unit modes passed 7200 epochs and
+266400 jobs with 1/4/24 participants, forced CV/default 20 ms waits,
+3600 publish hooks, 36 intentional hook exceptions, late workers,
+exactly-once callbacks/jobs, idle wake and shutdown (0.35 seconds enabled).
+
+The included N40 heat rule measured 60.6957 tok/s, 3.10% over N32, with
+three long cases faster and standard English slower. Its placement changes
+affected the existing CPU/GPU expert mix: none of the six sequences or
+DSpark counts matched N32. Target math was unchanged, so N40 did not
+repeat target CHECK. Its independent metadata oracle passed 4000 accepted
+windows with 384 experts, repeated routes, retained lengths 0..8,
+both decays, saturation and invalid-prefix immutability.
 The 70 tok/s target remains unmet. The API checkpoint above remains N21;
 these throughput results do not establish a later API checkpoint.
 The MXFP4 unit gate passed all 4096 scale/nibble pairs against an independent

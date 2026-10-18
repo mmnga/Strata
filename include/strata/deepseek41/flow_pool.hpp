@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <exception>
 #include <functional>
@@ -29,6 +30,8 @@ public:
         : cpus_(std::move(cpus)), spin_us_(spin_us), mwaitx_(native_mwaitx_enabled()) {
         if (cpus_.empty() || cpus_.size() > 48 || spin_us < 0)
             throw std::invalid_argument("invalid DeepSeek flow pool size/spin");
+        if(sparse_clock_ && mwaitx_) throw std::invalid_argument("native pool clock cadence requires MWAITX disabled");
+        if(sparse_clock_) std::fprintf(stderr,"strata CPU flow parked-worker clock checks every1024 pauses; original20ms CV deadline\n");
         cpu_set_t seen;
         CPU_ZERO(&seen);
         for (int cpu : cpus_) {
@@ -101,7 +104,14 @@ private:
         uint64_t seen = 0;
         for (;;) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us_);
+            uint32_t spins=0;
             while (!stop_.load(std::memory_order_acquire) && epoch_.load(std::memory_order_acquire) == seen) {
+                // ExpertPool's original parked-worker cadence: publication and
+                // stop are still checked every pause, only the clock is batched.
+                if(sparse_clock_) {
+                    _mm_pause();
+                    if((++spins & 1023u)!=0) continue;
+                }
                 if (std::chrono::steady_clock::now() >= deadline) {
                     std::unique_lock<std::mutex> lock(mutex_);
                     wake_.wait(lock, [&] {
@@ -109,6 +119,7 @@ private:
                     });
                     break;
                 }
+                if(sparse_clock_) continue; // The pause already preceded this clock check.
                 if(mwaitx_)hardware_epoch_wait(epoch_,stop_,seen);
                 else _mm_pause();
             }
@@ -133,6 +144,7 @@ private:
     std::vector<int> cpus_;
     int spin_us_;
     bool mwaitx_;
+    bool sparse_clock_ = [] {const char* v=std::getenv("STRATA_DS41_POOL_CLOCK");return v && std::atoi(v)!=0;}();
     bool caller_pinned_ = false;
     std::vector<std::thread> threads_;
     std::mutex mutex_;
