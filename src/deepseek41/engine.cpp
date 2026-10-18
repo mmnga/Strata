@@ -884,6 +884,7 @@ public:
     Rank rank;
     int position = 0, block_size = 5, mask = 0, context_limit = 0;
     bool replay = [] { const char* v=std::getenv("STRATA_DS41_DSPARK_GRAPH"); return v && std::atoi(v)!=0; }();
+    bool mxfp4_alu = [] { const char* v=std::getenv("STRATA_DS41_MXFP4_ALU"); return v && std::atoi(v)!=0; }();
     float min_confidence = [] { const char* v=std::getenv("STRATA_DS41_DSPARK_P_MIN"); return v ? std::stof(v) : 0.0f; }();
     Host<int32_t> proposals{Batch};
     Host<float> confidence{Batch};
@@ -1008,8 +1009,8 @@ public:
         C::swiglu(r.f("gate",F),r.f("up",F),r.f("hidden",F),n*F,float(c.clamp_shared[l]),r.stream);
         r.mat(p+"ffn_down_shexp.weight",r.f("hidden",F),r.f("shared",H),n);
         auto* ids = r.buffer("route_ids",size_t(c.top_k)*4).i();
-        C::mxfp4_gu(r.w(p+"ffn_gate_exps.weight").storage->p,r.w(p+"ffn_up_exps.weight").storage->p,r.f("norm",H),ids,r.f("expert_hidden",F*c.top_k),H,F,c.top_k,n,float(c.clamp_expert[l]),r.stream);
-        C::mxfp4_down(r.w(p+"ffn_down_exps.weight").storage->p,r.f("expert_hidden",F*c.top_k),ids,r.f("parts",H*c.top_k),F,H,c.top_k,n,r.stream);
+        C::mxfp4_gu(r.w(p+"ffn_gate_exps.weight").storage->p,r.w(p+"ffn_up_exps.weight").storage->p,r.f("norm",H),ids,r.f("expert_hidden",F*c.top_k),H,F,c.top_k,n,float(c.clamp_expert[l]),r.stream,mxfp4_alu);
+        C::mxfp4_down(r.w(p+"ffn_down_exps.weight").storage->p,r.f("expert_hidden",F*c.top_k),ids,r.f("parts",H*c.top_k),F,H,c.top_k,n,r.stream,mxfp4_alu);
         C::combine(r.f("parts",H*c.top_k),r.f("route_weights",c.top_k),r.f("shared",H),r.f("ffn",H),H,c.top_k,n,r.stream);
     }
     void noise_decode(int n) {

@@ -44,11 +44,11 @@ void draft_confidence(const float* hidden,const float* markov,const float* weigh
                       float* out,int hidden_width,int markov_width,void* stream);
 void hc_mean(const float* residual,float* y,int hidden,int tokens,int dst_stride,void* stream);
 // Original DSpark MXFP4 blocks (17 bytes / 32 values). No weight conversion.
-void mxfp4_mmv(const void* w,const float* x,float* y,int n_in,int n_out,int tokens,void* stream);
+void mxfp4_mmv(const void* w,const float* x,float* y,int n_in,int n_out,int tokens,void* stream,bool alu=false);
 void mxfp4_gu(const void* gate,const void* up,const float* x,const int32_t* ids,float* hidden,
-              int n_in,int n_ff,int top_k,int tokens,float limit,void* stream);
+              int n_in,int n_ff,int top_k,int tokens,float limit,void* stream,bool alu=false);
 void mxfp4_down(const void* down,const float* hidden,const int32_t* ids,float* out,
-                int n_ff,int n_out,int top_k,int tokens,void* stream);
+                int n_ff,int n_out,int top_k,int tokens,void* stream,bool alu=false);
 
 struct Rope {
     int dim = 64, original_context = 0;

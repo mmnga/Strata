@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N21 settings. From the checkout root, copy it to an ignored local file:
+N22 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -77,7 +77,8 @@ Engram history. Other sampling uses ordinary native decoding.
 The adopted profile also enables attention graphs, the CPU expert flow,
 selected cold-expert GPU streaming, packed FFN metadata, mapped CPU outputs,
 grouped output projections, route handoff, shared softmax weights,
-dimension-parallel attention values and prefetched query fragments.
+dimension-parallel attention values and prefetched query fragments. N22 replaces DSpark's MXFP4 nibble table with an exactly
+equivalent integer decode; original weight blocks and scales are retained.
 Unadopted diagnostic paths remain disabled in the example.
 
 ## Validation and measured performance
@@ -86,9 +87,9 @@ The native tests cover metadata, HC, Engram hashing, routing, F16 ring and
 sparse attention, YaRN, stable indexing, original MXFP4, CPU row phases,
 cache leases, transfers, output projections and graph replay.
 The original-model serial-versus-batch8 and rejected-tail checks passed
-with bit-identical logits for N21. All six fixed-workload output sequences
-and acceptance counts matched N19. Python tests cover DeepSeek's tokenizer,
-BOS/EOS, template, DSML tools and tool history. API checks passed for English,
+with bit-identical logits for N21; N22 changes only draft weight decoding. All six fixed-workload output sequences
+and acceptance counts for N22 matched N21. Python tests cover DeepSeek's tokenizer,
+BOS/EOS, template, DSML tools and tool history. The N21 API checkpoint passed for English,
 Japanese, chat streaming, Responses, Anthropic Messages, tool calls/history,
 tool streaming, the web UI and authentication.
 
@@ -98,17 +99,20 @@ Host model residency was 409.518 GiB, in addition to GPU-resident weights.
 
 | Sequential workload | Output tokens | Decode tok/s |
 | --- | ---: | ---: |
-| Standard English | 1024 | 55.8836 |
-| Standard Japanese | 1024 | 52.5986 |
-| Held-out English | 1024 | 50.4281 |
-| Held-out Japanese | 1024 | 55.8803 |
-| Aggregate | 4096 | **53.5964** |
+| Standard English | 1024 | 57.3942 |
+| Standard Japanese | 1024 | 54.7322 |
+| Held-out English | 1024 | 51.8510 |
+| Held-out Japanese | 1024 | 58.1604 |
+| Aggregate | 4096 | **55.4216** |
 
-The aggregate is 4092 timed tokens divided by 76.3484 seconds of decode;
+The aggregate is 4092 timed tokens divided by 73.8340 seconds of decode;
 each request excludes its first output token from the timed count. It is
-4.45% faster than N19 on this fixed workload, with the same output IDs and
+3.41% faster than N21 on this fixed workload, with the same output IDs and
 acceptance counts. Model disk-read and major-fault deltas were zero, and
 all serving processes had zero swap. The 70 tok/s target remains unmet.
+The MXFP4 unit gate passed all 4096 scale/nibble pairs against an independent
+CPU exponent reference on each GPU, plus 48 bit-identical GU/Down graph
+replays at H5120/F2304, top3, NT1..8 (1.04 seconds).
 These are workload-specific development measurements, not a speed guarantee
 for other prompts or hardware. Raw runs and generated result cards stay local.
 
