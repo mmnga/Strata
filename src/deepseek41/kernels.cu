@@ -540,6 +540,54 @@ __global__ void attention_chunk_merge_kernel(const float* scratch,const float* s
     }
 }
 
+// Parallelize independent rows without changing any row's original dot order.
+// The following pass keeps the original whole-head 256-thread reductions.
+__global__ void attention_score_grid_kernel(const float* q,const half* raw,const half* comp,
+    const int32_t* ids,float* scores,unsigned long long* pointers,int d,int heads,int window,
+    const int32_t* positions,int ratio,int max_selected,int ids_stride,int capacity,int stride) {
+    const int token=blockIdx.y,head=blockIdx.x,lane=threadIdx.x%32,warp=threadIdx.x/32;
+    const int pos=positions[token],first=max(0,pos-window+1),nr=pos-first+1;
+    const int selected=ratio ? min((pos+1)/ratio,max_selected) : 0,n=nr+selected;
+    const int base=int(blockIdx.z)*8;
+    if(base>=n) return; // Uniform across the CTA, before its query barrier.
+    __shared__ float query[512];
+    const size_t slot=size_t(token)*heads+head;
+    for(int i=threadIdx.x;i<d;i+=blockDim.x) query[i]=q[slot*d+i];
+    __syncthreads();
+    const int row=base+warp;
+    if(row>=n) return; // Entire warp returns; all query loads already completed.
+    if(ids) ids+=size_t(token)*ids_stride;
+    const half* key=row<nr ? raw+size_t((first+row)%capacity)*d :
+        comp+size_t(ids ? ids[row-nr] : row-nr)*d;
+    float query_fragment[16];uint16_t fragment[16];
+#pragma unroll
+    for(int k=0;k<16;++k) query_fragment[k]=query[lane+32*k];
+#pragma unroll
+    for(int k=0;k<16;++k) fragment[k]=reinterpret_cast<const uint16_t*>(key)[lane+32*k];
+    float dot=0;
+#pragma unroll
+    for(int k=0;k<16;++k) dot+=query_fragment[k]*__half2float(__ushort_as_half(fragment[k]));
+    for(int k=16;k;k>>=1) dot+=__shfl_down_sync(0xffffffffu,dot,k);
+    if(!lane) {
+        scores[slot*stride+row]=dot*rsqrtf(float(d));
+        pointers[slot*stride+row]=reinterpret_cast<unsigned long long>(key);
+    }
+}
+__global__ void attention_score_softmax_kernel(float* weights,const float* sinks,int heads,int window,
+    const int32_t* positions,int ratio,int max_selected,int stride) {
+    extern __shared__ float scores[];
+    const int head=blockIdx.x,token=blockIdx.y,pos=positions[token],first=max(0,pos-window+1);
+    const int n=pos-first+1+(ratio ? min((pos+1)/ratio,max_selected) : 0);
+    weights+=(size_t(token)*heads+head)*stride;
+    for(int row=threadIdx.x;row<n;row+=blockDim.x) scores[row]=weights[row];
+    __syncthreads();
+    float m=sinks[head];for(int row=threadIdx.x;row<n;row+=blockDim.x) m=fmaxf(m,scores[row]);
+    m=maximum(m);
+    float denom=threadIdx.x==0 ? expf(sinks[head]-m) : 0;
+    for(int row=threadIdx.x;row<n;row+=blockDim.x) {scores[row]=expf(scores[row]-m);denom+=scores[row];}
+    denom=sum(denom);
+    for(int row=threadIdx.x;row<n;row+=blockDim.x) weights[row]=scores[row]/denom;
+}
 __device__ __forceinline__ uint16_t global_value_bits(const uint16_t* pointer) {
     uint16_t value;
     asm("ld.global.ca.u16 %0, [%1];" : "=h"(value) : "l"(pointer));
@@ -751,6 +799,25 @@ void attention_positions_query_prefetch(const float* q,const uint16_t* raw,const
     if(value_prefetch) attention_value_kernel<true,true><<<dim3(heads,tokens,8),64,shared,stream_cast(s)>>>(weights,rows,out,d,heads,
         window,pos,ratio,max_selected,stride);
     else attention_value_kernel<false,true><<<dim3(heads,tokens,8),64,shared,stream_cast(s)>>>(weights,rows,out,d,heads,
+        window,pos,ratio,max_selected,stride);
+}
+void attention_positions_score_grid(const float* q,const uint16_t* raw,const uint16_t* comp,const int32_t* ids,
+    const float* sinks,float* out,void* scratch,int d,int heads,int tokens,int window,const int32_t* pos,
+    int ratio,int max_selected,int ids_stride,int raw_capacity,void* s) {
+    if(d!=512 || heads<1 || tokens<1 || tokens>8 || window!=128 || raw_capacity<window+tokens ||
+       ratio<0 || ratio>2 || (max_selected!=0 && max_selected!=512) || (ratio && !comp) || !scratch)
+        throw std::invalid_argument("DeepSeek score-grid geometry");
+    const int stride=window+max_selected;
+    const size_t count=size_t(heads)*tokens*stride;
+    auto* weights=static_cast<float*>(scratch);
+    auto* rows=reinterpret_cast<unsigned long long*>(static_cast<unsigned char*>(scratch)+((count*4+255)&~size_t(255)));
+    attention_score_grid_kernel<<<dim3(heads,tokens,(stride+7)/8),threads,0,stream_cast(s)>>>(q,
+        reinterpret_cast<const half*>(raw),reinterpret_cast<const half*>(comp),ids,weights,rows,d,heads,window,
+        pos,ratio,max_selected,ids_stride,raw_capacity,stride);
+    attention_score_softmax_kernel<<<dim3(heads,tokens),threads,size_t(stride)*4,stream_cast(s)>>>(weights,sinks,
+        heads,window,pos,ratio,max_selected,stride);
+    const size_t shared=((size_t(stride)*4+7)&~size_t(7))+size_t(stride)*8;
+    attention_value_kernel<false,true><<<dim3(heads,tokens,8),64,shared,stream_cast(s)>>>(weights,rows,out,d,heads,
         window,pos,ratio,max_selected,stride);
 }
 void top_k(float* scores,int32_t* ids,int rows,int k,void* s) {

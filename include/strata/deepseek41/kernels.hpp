@@ -123,6 +123,11 @@ void attention_positions_query_prefetch(const float* q,const uint16_t* raw,const
     int ratio,int max_selected,int ids_stride,int raw_capacity,void* stream,bool value_prefetch);
 
 
+// Independent QK rows, original whole-head softmax tree and value FMA order.
+void attention_positions_score_grid(const float* q,const uint16_t* raw,const uint16_t* comp,const int32_t* ids,
+    const float* sinks,float* out,void* scratch,int d,int heads,int tokens,int window,const int32_t* pos,
+    int ratio,int max_selected,int ids_stride,int raw_capacity,void* stream);
+
 // Destructive scratch scores; stable ties prefer lower row id.
 void top_k(float* scores, int32_t* ids, int rows, int k, void* stream);
 // Stable radix-sort path for long contexts; ids has capacity for all rows.

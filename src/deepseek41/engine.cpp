@@ -193,6 +193,7 @@ public:
     bool parallel_values = [] { const char* v=std::getenv("STRATA_DS41_ATTENTION_VALUES"); return v && std::atoi(v)!=0; }();
     bool prefetch_values = [] { const char* v=std::getenv("STRATA_DS41_VALUE_PREFETCH"); return v && std::atoi(v)!=0; }();
     bool prefetch_query = [] { const char* v=std::getenv("STRATA_DS41_QUERY_PREFETCH"); return v && std::atoi(v)!=0; }();
+    bool score_grid = [] { const char* v=std::getenv("STRATA_DS41_SCORE_GRID"); return v && std::atoi(v)!=0; }();
     Host<float> attention_parts, transfer, cpu_parts, activation, hc_transfer, tp_sum;
     Host<uint32_t> tp_ready{size_t(c.layers)*18,cudaHostAllocMapped|cudaHostAllocPortable};
     Host<uint32_t> tp_abort{1,cudaHostAllocMapped|cudaHostAllocPortable};
@@ -229,6 +230,8 @@ public:
             throw std::runtime_error("parallel values require original D512/window128/top512 and split-K disabled");
         if(prefetch_values && !parallel_values) throw std::runtime_error("value prefetch requires parallel values");
         if(prefetch_query && !parallel_values) throw std::runtime_error("query prefetch requires parallel values");
+        if(score_grid && (!parallel_values || !prefetch_query || prefetch_values || !attention_replay))
+            throw std::runtime_error("score grid requires query/parallel values, attention graph and value prefetch disabled");
         affinity = K::cpu::pin_current_thread(cpu.host_core());
         for (int r = 0; r < gpu_count; ++r) ranks.push_back(std::make_unique<Rank>(r,r,gpu_count));
         for (auto& rp : ranks) {
@@ -451,7 +454,10 @@ public:
         }
         auto attend=normalize_attention ? C::attention_positions_normalized : C::attention_positions;
         auto value_pass=prefetch_values ? C::attention_positions_values_prefetch : C::attention_positions_values;
-        if(parallel_values && prefetch_query) C::attention_positions_query_prefetch(r.f("q",D*A),r.raw[layer]->h(),ratio ? r.compressed[streams.kv_source]->h() : nullptr,
+        if(score_grid) C::attention_positions_score_grid(r.f("q",D*A),r.raw[layer]->h(),ratio ? r.compressed[streams.kv_source]->h() : nullptr,
+            ratio ? r.selected[streams.top_k_source]->i() : nullptr,r.weight(p+"attn_sinks.weight")+size_t(r.rank)*A,r.f("attn",D*A),
+            r.buffers.at("attention_values")->p,D,A,tokens,c.sliding_window,pos,ratio,ratio ? c.index_top_k : 0,context,c.sliding_window+Batch,r.stream);
+        else if(parallel_values && prefetch_query) C::attention_positions_query_prefetch(r.f("q",D*A),r.raw[layer]->h(),ratio ? r.compressed[streams.kv_source]->h() : nullptr,
             ratio ? r.selected[streams.top_k_source]->i() : nullptr,r.weight(p+"attn_sinks.weight")+size_t(r.rank)*A,r.f("attn",D*A),
             r.buffers.at("attention_values")->p,D,A,tokens,c.sliding_window,pos,ratio,ratio ? c.index_top_k : 0,context,c.sliding_window+Batch,r.stream,prefetch_values);
         else if(parallel_values) value_pass(r.f("q",D*A),r.raw[layer]->h(),ratio ? r.compressed[streams.kv_source]->h() : nullptr,
@@ -875,6 +881,7 @@ public:
         const bool candidate_parallel_values=parallel_values; parallel_values=false;
         const bool candidate_prefetch_values=prefetch_values; prefetch_values=false;
         const bool candidate_prefetch_query=prefetch_query; prefetch_query=false;
+        const bool candidate_score_grid=score_grid; score_grid=false;
         // The legacy oracle needs its duplicated FFN weights. Materialize only
         // these temporary matrices before timing, and never capture their
         // addresses into retained graphs. Production loads owner weights only.
@@ -903,6 +910,7 @@ public:
         parallel_values=candidate_parallel_values;
         prefetch_values=candidate_prefetch_values;
         prefetch_query=candidate_prefetch_query;
+        score_grid=candidate_score_grid;
         for(size_t rank=0;rank<ranks.size();++rank) ranks[rank]->graph_enabled=saved_graphs[rank];
         prefill(); process(inputs.data()+prefix,Batch,true,true); const auto actual = host_logits();
         auto compare = [&](const float* a,const float* b,size_t n,const char* stage) {

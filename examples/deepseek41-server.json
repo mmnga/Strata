@@ -53,7 +53,8 @@
     "STRATA_DS41_VALUE_PREFETCH": "0",
     "STRATA_DS41_QUERY_PREFETCH": "1",
     "STRATA_DS41_MXFP4_ALU": "1",
-    "STRATA_DS41_FFN_GRAPH": "1"
+    "STRATA_DS41_FFN_GRAPH": "1",
+    "STRATA_DS41_SCORE_GRID": "1"
   },
   "sampling": {
     "temperature": 0,
