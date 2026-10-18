@@ -3126,6 +3126,43 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
     launch_check();
 }
 
+void native_quantize_q8_1_il_wide(const float* x,void* x_q8_1,void* x_il,int n_in,int ncols,void* stream) {
+    validate_shape(n_in,ncols);
+    if(ncols<5 || ncols>8) throw std::invalid_argument("wide IL needs 5..8 columns");
+    validate_pointer(x);validate_pointer(x_q8_1);validate_pointer(x_il);validate_stream(stream);
+    const auto parts=q8_1_il_parts(x_il,n_in,ncols);
+    const int total=n_in*ncols;
+    native_quantize_q8_1_il_kernel<<<unsigned((total+QUANT_THREADS-1)/QUANT_THREADS),QUANT_THREADS,0,
+        static_cast<cudaStream_t>(stream)>>>(x,static_cast<Q81Block*>(x_q8_1),const_cast<int*>(parts.bm),
+        const_cast<int*>(parts.pm),const_cast<float*>(parts.d),n_in,total,native_q8_1_il_cp(ncols));
+    launch_check();
+}
+namespace {
+template<class I>
+void launch_il_wide(const void* weights,const void* x_il,float* y,int ni,int no,int nc,cudaStream_t stream) {
+    // One row per warp bounds the eight-column accumulator footprint. This
+    // is a single geometry choice, independent of the existing tuning table.
+    const auto parts=q8_1_il_parts(x_il,ni,nc);
+    const auto* w=static_cast<const typename I::F::Block*>(weights);
+    const unsigned blocks=unsigned((no+3)/4);
+    switch(nc) {
+#define WIDE_IL(N) case N: native_mmvq_il_kernel<I,N,1><<<blocks,4*WARP,0,stream>>>(w,parts.bm,parts.d,y,ni,no);break
+        WIDE_IL(5);WIDE_IL(6);WIDE_IL(7);WIDE_IL(8);
+#undef WIDE_IL
+        default:throw std::invalid_argument("wide IL needs 5..8 columns");
+    }
+}
+}
+void native_mmvq_il_wide(int type,const void* weights,const void* x_il,float* y,int ni,int no,int nc,void* stream) {
+    validate_shape(ni,nc,QK);
+    if(no<1 || nc<5 || nc>8 || (type!=12 && type!=14) || !g_multi_exact)
+        throw std::invalid_argument("wide IL needs exact Q4_K/Q6_K and 5..8 columns");
+    validate_pointer(weights);validate_pointer(x_il);validate_pointer(y);validate_stream(stream);
+    if(type==12) launch_il_wide<IlQ4K>(weights,x_il,y,ni,no,nc,static_cast<cudaStream_t>(stream));
+    else launch_il_wide<IlQ6K>(weights,x_il,y,ni,no,nc,static_cast<cudaStream_t>(stream));
+    launch_check();
+}
+
 namespace {
 template<class F,int NC>
 void grouped_plain(const void* weights,const void* quant,float* y,int ni,int no,int groups,cudaStream_t s) {

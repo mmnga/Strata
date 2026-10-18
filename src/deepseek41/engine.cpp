@@ -88,6 +88,7 @@ struct Rank {
     std::map<std::string,std::unique_ptr<Buffer>> buffers;
     std::map<std::tuple<int,int,int>,strata::core::CapturedGraph> graphs;
     bool graph_enabled = [] { const char* v = std::getenv("STRATA_DS41_GRAPHS"); return !v || std::atoi(v) != 0; }();
+    bool wide_il = [] { const char* v=std::getenv("STRATA_DS41_WIDE_IL"); return v && std::atoi(v)!=0; }();
     std::vector<std::unique_ptr<Buffer>> raw, compressed, keys, projections, pool_scores, selected;
     explicit Rank(int d,int r,int n) : id(d),rank(r),count(n) { ck(cudaSetDevice(id)); ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking)); }
     ~Rank() { cudaSetDevice(id); cudaStreamSynchronize(stream); graphs.clear(); matrices.clear(); buffers.clear(); raw.clear(); compressed.clear(); keys.clear(); projections.clear(); pool_scores.clear(); selected.clear(); cudaStreamDestroy(stream); }
@@ -145,7 +146,11 @@ struct Rank {
     }
     void quant_mat(int type,const void* weights,const float* x,float* y,int in,int out,int tokens) {
         void* scratch = buffer("q8",K::native_q8_1_bytes(in,tokens)).p;
-        if (tokens > 1 && tokens <= 4 && K::native_mmvq_il_supported(type,tokens,out)) {
+        if(wide_il && tokens>=5 && tokens<=8 && (type==12 || type==14)) {
+            void* interleaved=buffer("q8_il",K::native_q8_1_il_bytes(in,tokens)).p;
+            K::native_quantize_q8_1_il_wide(x,scratch,interleaved,in,tokens,stream);
+            K::native_mmvq_il_wide(type,weights,interleaved,y,in,out,tokens,stream);
+        } else if (tokens > 1 && tokens <= 4 && K::native_mmvq_il_supported(type,tokens,out)) {
             void* interleaved = buffer("q8_il",K::native_q8_1_il_bytes(in,tokens)).p;
             K::native_quantize_q8_1_il(x,scratch,interleaved,in,tokens,stream);
             K::native_mmvq_il(type,weights,scratch,interleaved,y,in,out,tokens,stream);
@@ -887,8 +892,10 @@ public:
         // addresses into retained graphs. Production loads owner weights only.
         std::vector<std::pair<Rank*,std::string>> temporary_weights;
         std::vector<bool> saved_graphs;
+        std::vector<bool> saved_wide_il;
         for(auto& rp:ranks) {
             auto& r=*rp; saved_graphs.push_back(r.graph_enabled); r.graph_enabled=false;
+            saved_wide_il.push_back(r.wide_il); r.wide_il=false;
             ck(cudaSetDevice(r.id));
             for(size_t shard=0;shard<model.gguf().size();++shard) for(const auto& tensor:model.gguf().shard(shard).tensors()) {
                 if(!owner_ffn_weight(tensor.name) || tensor.name.find("_exps.weight")!=std::string::npos || r.matrices.contains(tensor.name)) continue;
@@ -911,7 +918,10 @@ public:
         prefetch_values=candidate_prefetch_values;
         prefetch_query=candidate_prefetch_query;
         score_grid=candidate_score_grid;
-        for(size_t rank=0;rank<ranks.size();++rank) ranks[rank]->graph_enabled=saved_graphs[rank];
+        for(size_t rank=0;rank<ranks.size();++rank) {
+            ranks[rank]->graph_enabled=saved_graphs[rank];
+            ranks[rank]->wide_il=saved_wide_il[rank];
+        }
         prefill(); process(inputs.data()+prefix,Batch,true,true); const auto actual = host_logits();
         auto compare = [&](const float* a,const float* b,size_t n,const char* stage) {
             double worst = 0, ss = 0, ref = 0;
@@ -1000,6 +1010,10 @@ public:
         r.f("expert_hidden",F*c.top_k); r.f("parts",H*c.top_k);
         r.f("features",H*3); r.f("encoded",H); r.f("logits",c.vocab); r.f("markov",256); r.f("bias",c.vocab); r.f("confidence",1);
         r.buffer("token",4); r.buffer("position",4); r.buffer("pick",4); r.buffer("q8",K::native_q8_1_bytes(H*4));
+        // The copied original target_output is Q6_K. Five-position noise
+        // decoding can use wide IL before any legacy IL allocation exists.
+        // Allocate outside capture; the same bounded reserve covers it.
+        if(r.wide_il) r.buffer("q8_il",K::native_q8_1_il_bytes(H*4,Batch));
         r.raw.resize(3); for (auto& raw : r.raw) raw = std::make_unique<Buffer>(r.id,size_t(c.sliding_window+Batch)*D*2);
     }
     C::Rope rope_config() const { C::Rope rc; rc.dim = c.rope_dim; rc.base = float(c.rope_base); return rc; }
