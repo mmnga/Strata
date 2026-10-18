@@ -29,6 +29,12 @@ void combine(const float* parts, const float* weights, const float* shared, floa
 void combine_sources(const float* device_parts,const float* host_parts,const uint64_t* gpu_mask,
                      const float* weights,const float* shared,float* y,
                      int hidden,int top_k,int tokens,void* stream);
+// Same FMA order, coherent mapped CPU reads after a device-side Host wait.
+void combine_sources_system(const float* device_parts,const float* host_parts,const uint64_t* gpu_mask,
+                            const float* weights,const float* shared,float* y,
+                            int hidden,int top_k,int tokens,void* stream);
+// Exact sequence equality also handles uint32 rollover. Abort releases a wait.
+void wait_host(const uint32_t* ready,const uint32_t* expected,const uint32_t* abort,void* stream);
 void dense(const float* w, const float* x, float* y, int n_in, int n_out, int tokens, void* stream);
 void add(const float* x, const float* y, float* out, int count, void* stream);
 // Original CPU rank-order sum, after Qwen's mapped partial publication.

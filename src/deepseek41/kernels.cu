@@ -172,6 +172,7 @@ __global__ void combine_kernel(const float* parts, const float* w, const float* 
     float v = 0; for (int j = 0; j < k; ++j) v += parts[size_t(j)*h]*w[j];
     y[size_t(t)*h+i] = v+(shared ? shared[size_t(t)*h+i] : 0.0f);
 }
+template<bool System=false>
 __global__ void combine_sources_kernel(const float* device_parts,const float* host_parts,const uint64_t* gpu_mask,
                                        const float* w,const float* shared,float* y,int h,int k) {
     const int t=blockIdx.y, i=blockIdx.x*blockDim.x+threadIdx.x;
@@ -180,8 +181,16 @@ __global__ void combine_sources_kernel(const float* device_parts,const float* ho
     float v=0;
     for(int j=0;j<k;++j) {
         const int row=t*k+j;
-        const float* parts=(mask & (uint64_t(1)<<row)) ? device_parts : host_parts;
-        v+=parts[size_t(row)*h+i]*w[j];
+        float part;
+        if constexpr(System) {
+            const size_t at=size_t(row)*h+i;
+            part=(mask & (uint64_t(1)<<row)) ? device_parts[at] :
+                reinterpret_cast<const volatile float*>(host_parts)[at];
+        } else {
+            const float* parts=(mask & (uint64_t(1)<<row)) ? device_parts : host_parts;
+            part=parts[size_t(row)*h+i];
+        }
+        v+=part*w[j];
     }
     y[size_t(t)*h+i]=v+(shared ? shared[size_t(t)*h+i] : 0.0f);
 }
@@ -383,6 +392,25 @@ __global__ void topk_kernel(float* scores, int32_t* ids, int rows, int k) {
 __global__ void sequence_kernel(int32_t* ids,int n) {
     const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i < n) ids[i] = i;
 }
+__device__ __forceinline__ uint32_t load_system(const uint32_t* pointer) {
+#if __CUDA_ARCH__ >= 700
+    uint32_t value;
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(value) : "l"(pointer) : "memory");
+    return value;
+#else
+    return *reinterpret_cast<const volatile uint32_t*>(pointer);
+#endif
+}
+__global__ void host_wait_kernel(const uint32_t* ready,const uint32_t* expected,const uint32_t* abort) {
+    if(threadIdx.x) return;
+    const uint32_t want=load_system(expected);
+    while(load_system(ready)!=want && !load_system(abort)) {
+#if __CUDA_ARCH__ >= 700
+        __nanosleep(64);
+#endif
+    }
+    __threadfence_system();
+}
 __global__ void tp_sum_wait_kernel(const float* local,const volatile float* peer,
     const volatile uint32_t* own_ready,const volatile uint32_t* peer_ready,
     const volatile uint32_t* abort,float* out,int n,int rank) {
@@ -575,7 +603,14 @@ void route(const float* l,const float* b,int32_t* ids,float* w,int e,int k,int t
 void swiglu(const float* g,const float* u,float* y,int n,float limit,void* s) { swiglu_kernel<<<(n+255)/256,threads,0,stream_cast(s)>>>(g,u,y,n,limit); }
 void combine(const float* p,const float* w,const float* sh,float* y,int h,int k,int t,void* s) { combine_kernel<<<dim3((h+255)/256,t),threads,0,stream_cast(s)>>>(p,w,sh,y,h,k); }
 void combine_sources(const float* p,const float* cpu,const uint64_t* mask,const float* w,const float* sh,float* y,int h,int k,int t,void* s) {
-    combine_sources_kernel<<<dim3((h+255)/256,t),threads,0,stream_cast(s)>>>(p,cpu,mask,w,sh,y,h,k);
+    combine_sources_kernel<false><<<dim3((h+255)/256,t),threads,0,stream_cast(s)>>>(p,cpu,mask,w,sh,y,h,k);
+}
+void combine_sources_system(const float* p,const float* cpu,const uint64_t* mask,const float* w,const float* sh,float* y,int h,int k,int t,void* s) {
+    combine_sources_kernel<true><<<dim3((h+255)/256,t),threads,0,stream_cast(s)>>>(p,cpu,mask,w,sh,y,h,k);
+}
+void wait_host(const uint32_t* ready,const uint32_t* expected,const uint32_t* abort,void* s) {
+    if(!ready || !expected || !abort) throw std::invalid_argument("native mapped Host wait needs valid words");
+    host_wait_kernel<<<1,32,0,stream_cast(s)>>>(ready,expected,abort);
 }
 void dense(const float* w,const float* x,float* y,int ni,int no,int t,void* s) { dense_kernel<<<dim3(no,t),threads,0,stream_cast(s)>>>(w,x,y,ni,no); }
 void add(const float* x,const float* y,float* out,int n,void* s) { add_kernel<<<(n+255)/256,threads,0,stream_cast(s)>>>(x,y,out,n); }

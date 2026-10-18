@@ -28,6 +28,7 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <exception>
 #include <string>
 #include <vector>
 #include <source_location>
@@ -82,6 +83,7 @@ struct Rank {
     float* mapped_activation = nullptr;
     int32_t* mapped_route_ids = nullptr;
     uint32_t* mapped_route_bell = nullptr;
+    uint32_t* mapped_ffn_ready = nullptr;
     std::map<std::string,Matrix> matrices;
     std::map<std::string,std::unique_ptr<Buffer>> buffers;
     std::map<std::tuple<int,int,int>,strata::core::CapturedGraph> graphs;
@@ -185,6 +187,7 @@ public:
     bool grouped_oa = [] { const char* v=std::getenv("STRATA_DS41_GROUPED_OA"); return v && std::atoi(v)!=0; }();
     bool route_handoff = [] { const char* v=std::getenv("STRATA_DS41_ROUTE_HANDOFF"); return v && std::atoi(v)!=0; }();
     bool tp_graph = [] { const char* v=std::getenv("STRATA_DS41_TP_GRAPH"); return v && std::atoi(v)!=0; }();
+    bool ffn_graph = [] { const char* v=std::getenv("STRATA_DS41_FFN_GRAPH"); return v && std::atoi(v)!=0; }();
     bool normalize_attention = [] { const char* v=std::getenv("STRATA_DS41_ATTENTION_WEIGHTS"); return v && std::atoi(v)!=0; }();
     bool chunked_attention = [] { const char* v=std::getenv("STRATA_DS41_ATTENTION_CHUNKS"); return v && std::atoi(v)!=0; }();
     bool parallel_values = [] { const char* v=std::getenv("STRATA_DS41_ATTENTION_VALUES"); return v && std::atoi(v)!=0; }();
@@ -216,6 +219,8 @@ public:
         *ffn_plan.p=FfnPlan{};
         std::fill_n(route_bell.p,route_bell.n,0u);
         std::fill_n(tp_ready.p,tp_ready.n,0u); *tp_abort.p=0;
+        if(ffn_graph && (gpu_count!=2 || tp_graph || !route_handoff || !direct_ffn || hc_owner))
+            throw std::runtime_error("FFN graph requires TP2, route handoff, direct FFN, mirrored HC and TP graph disabled");
         if(tp_graph && (gpu_count!=2 || !route_handoff || !attention_replay || hc_owner))
             throw std::runtime_error("TP graph requires TP2, route handoff, attention graph and mirrored HC");
         if(chunked_attention && (c.head_dim!=512 || c.sliding_window!=128 || c.index_top_k!=512 || (c.heads/gpu_count)%4))
@@ -247,6 +252,11 @@ public:
             if(tp_graph) {
                 ck(cudaHostGetDevicePointer(&r.mapped_attention_parts,attention_parts.p,0));
                 ck(cudaHostGetDevicePointer(&r.mapped_tp_ready,tp_ready.p,0));
+                ck(cudaHostGetDevicePointer(&r.mapped_tp_abort,tp_abort.p,0));
+            }
+            if(ffn_graph) {
+                // TP graph is disabled; reuse its first otherwise-unused Host word.
+                ck(cudaHostGetDevicePointer(&r.mapped_ffn_ready,tp_ready.p,0));
                 ck(cudaHostGetDevicePointer(&r.mapped_tp_abort,tp_abort.p,0));
             }
             if(route_handoff) {
@@ -575,6 +585,17 @@ public:
         K::native_quantize_q8_1(x,r.buffer("expert_xq",K::native_q8_1_bytes(H,tokens)).p,H,tokens,r.stream);
     }
     void ffn(int layer,int tokens = 1) {
+        struct AbortOnException {
+            uint32_t* word;
+            int depth;
+            explicit AbortOnException(uint32_t* p) : word(p),depth(p ? std::uncaught_exceptions() : 0) {}
+            ~AbortOnException() {
+                if(word && std::uncaught_exceptions()>depth) {
+                    *static_cast<volatile uint32_t*>(word)=1;
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                }
+            }
+        } abort_on_exception(ffn_graph ? tp_abort.p : nullptr);
         const int H = c.hidden;
         const auto p = block(layer);
         // Routed/shared experts run once, on the layer's owner rank. Both TP
@@ -645,6 +666,14 @@ public:
             batch.tokens[batch.count] = j/c.top_k; batch.destinations[batch.count] = j; ++batch.count;
             misses.push_back(j);
         }
+        auto combine=[&] {
+            if(direct_ffn) {
+                const auto fn=ffn_graph ? C::combine_sources_system : C::combine_sources;
+                fn(r.f("parts",size_t(H)*c.top_k),r.mapped_cpu_parts,
+                &static_cast<FfnPlan*>(r.buffers.at("ffn_plan")->p)->gpu_mask,r.f("route_weights",c.top_k),
+                r.f("shared",H),r.f("ffn",H),H,c.top_k,tokens,r.stream);
+            } else C::combine(r.f("parts",size_t(H)*c.top_k),r.f("route_weights",c.top_k),r.f("shared",H),r.f("ffn",H),H,c.top_k,tokens,r.stream);
+        };
         if (!gpu_groups.empty()) {
             auto* pointers=direct_ffn ? ffn_plan.p->pointers : group_ptr.p;
             auto* starts=direct_ffn ? ffn_plan.p->starts : group_start.p;
@@ -667,7 +696,7 @@ public:
             ck(cudaMemcpyAsync(r.buffers.at("expert_group_count")->p,group_count.p,4,cudaMemcpyHostToDevice,r.stream));
             }
             const auto layout = K::native_expert_layout(int(g.tensor->type),int(d.tensor->type),H,c.expert_ff);
-            r.launch(layer,5,tokens,[&] {
+            if(!ffn_graph) r.launch(layer,5,tokens,[&] {
                 if(direct_ffn) {
                     auto* plan=static_cast<FfnPlan*>(r.buffers.at("ffn_plan")->p);
                     ck(cudaMemcpyAsync(plan,ffn_plan.p,sizeof(FfnPlan),cudaMemcpyHostToDevice,r.stream));
@@ -682,9 +711,23 @@ public:
                     r.stream,float(c.clamp_expert[layer]));
                 }
             });
-        } else if(direct_ffn) {
+        } else if(direct_ffn && !ffn_graph) {
             // No grouped kernel is needed, but the combine still needs mask=0.
             ck(cudaMemcpyAsync(r.buffers.at("ffn_plan")->p,ffn_plan.p,sizeof(FfnPlan),cudaMemcpyHostToDevice,r.stream));
+        }
+        if(ffn_graph) {
+            const bool any_cached=!gpu_groups.empty();
+            const auto layout=K::native_expert_layout(int(g.tensor->type),int(d.tensor->type),H,c.expert_ff);
+            r.launch(layer,any_cached ? 96 : 97,tokens,[&] {
+                auto* plan=static_cast<FfnPlan*>(r.buffers.at("ffn_plan")->p);
+                ck(cudaMemcpyAsync(plan,ffn_plan.p,sizeof(FfnPlan),cudaMemcpyHostToDevice,r.stream));
+                if(any_cached) K::native_expert_grouped_clamp(layout,plan->pointers,plan->starts,&plan->groups,
+                    plan->destinations,plan->tokens,entries,entries,r.buffers.at("expert_xq")->p,
+                    r.buffers.at("expert_scratch")->p,r.f("parts",size_t(H)*c.top_k),r.stream,float(c.clamp_expert[layer]));
+                C::wait_host(r.mapped_ffn_ready,r.mapped_route_bell,r.mapped_tp_abort,r.stream);
+                combine();
+                ck(cudaMemcpyAsync(transfer.p,r.f("ffn",H),size_t(H)*tokens*4,cudaMemcpyDeviceToHost,r.stream));
+            });
         }
         const auto cpu_jobs=streamed ? streamed->submit(layer,r.id,jobs,activation.p,tokens) : jobs;
         cpu.run_multi(cpu_jobs,activation.p,tokens,cpu_parts.p);
@@ -692,13 +735,12 @@ public:
         ck(cudaSetDevice(r.id));
         if(!direct_ffn) for (int j : misses) ck(cudaMemcpyAsync(r.f("parts",size_t(H)*c.top_k)+size_t(j)*H,cpu_parts.p+size_t(j)*H,size_t(H)*4,cudaMemcpyHostToDevice,r.stream));
         else std::atomic_thread_fence(std::memory_order_release);
-        auto combine=[&] {
-            if(direct_ffn) C::combine_sources(r.f("parts",size_t(H)*c.top_k),r.mapped_cpu_parts,
-                &static_cast<FfnPlan*>(r.buffers.at("ffn_plan")->p)->gpu_mask,r.f("route_weights",c.top_k),
-                r.f("shared",H),r.f("ffn",H),H,c.top_k,tokens,r.stream);
-            else C::combine(r.f("parts",size_t(H)*c.top_k),r.f("route_weights",c.top_k),r.f("shared",H),r.f("ffn",H),H,c.top_k,tokens,r.stream);
-        };
-        if(hc_owner) {
+        if(ffn_graph) {
+            // Publish only after CPU and cold outputs are complete. Preserve
+            // the original owner stream fence before buffer/cache reuse.
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            *static_cast<volatile uint32_t*>(tp_ready.p)=route_sequence;
+        } else if(hc_owner) {
             r.launch(layer,6,tokens,[&] {
                 combine();
                 C::hc_post(r.f("ffn",H),r.f("residual",H*4),r.f("post",4),r.f("comb",16),r.f("residual",H*4),H,tokens,r.stream);
@@ -729,7 +771,7 @@ public:
         }
     }
     void process(const int32_t* inputs,int tokens,bool output = true,bool verify = false) {
-        if(tp_graph && *tp_abort.p) throw std::runtime_error("native TP graph aborted");
+        if((tp_graph || ffn_graph) && *tp_abort.p) throw std::runtime_error("native mapped graph aborted");
         if (tokens < 1 || tokens > Batch || position+tokens > context) throw std::runtime_error("native token/context out of range");
         for (int t = 0; t < tokens; ++t) if (inputs[t] < 0 || inputs[t] >= c.vocab) throw std::runtime_error("invalid native input token");
         speculative = verify;
@@ -827,6 +869,7 @@ public:
         const bool candidate_grouped_oa=grouped_oa; grouped_oa=false;
         const bool candidate_route_handoff=route_handoff; route_handoff=false;
         const bool candidate_tp_graph=tp_graph; tp_graph=false;
+        const bool candidate_ffn_graph=ffn_graph; ffn_graph=false;
         const bool candidate_normalize_attention=normalize_attention; normalize_attention=false;
         const bool candidate_chunked_attention=chunked_attention; chunked_attention=false;
         const bool candidate_parallel_values=parallel_values; parallel_values=false;
@@ -854,6 +897,7 @@ public:
         grouped_oa=candidate_grouped_oa;
         route_handoff=candidate_route_handoff;
         tp_graph=candidate_tp_graph;
+        ffn_graph=candidate_ffn_graph;
         normalize_attention=candidate_normalize_attention;
         chunked_attention=candidate_chunked_attention;
         parallel_values=candidate_parallel_values;
