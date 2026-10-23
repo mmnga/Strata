@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N60 settings. From the checkout root, copy it to an ignored local file:
+N65 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -270,3 +270,26 @@ NT1..8, captureon/off and changing signedzero/subnormal inputs. A local
 operator gate measured1.05219x (15/16pairs faster), which is not a model
 speed prediction. Original F16C functions and numerical operator sources
 remain unchanged. No new N60 API checkpoint;70tok/s goal remains unmet.
+
+
+N65 enables `STRATA_DS41_ROUTER_PIPE4=1` for the main router only. All40
+source matrices must be BF16/type30 at5120x384; this is checked before RAM
+registration. Their existing F32 expansion, per-thread FMA order and
+256-thread reduction remain unchanged. Four immutable operand loads are
+issued before their dependent FMAs. The original serial CHECK disables
+this path for its reference. HC matrices are Q4_K and keep their original
+quantized operators; draft and lookahead operators remain unchanged.
+
+N65 measured **61.7552tok/s** (4092timed tokens/
+66.2616s), observed+0.0812%vsN60.
+Long cases:standard en 62.04362; standard ja 65.71045; heldout en 55.48956; heldout ja 64.87412. The tiny single-suite difference can be noise and is
+not a significance claim. All6output sequences/draftcounts matchN60;
+batch8/rollback CHECK max_abs/rRMS0, modelreads/majorfaults0 in allcases,
+READYmain+2lockers swap0,409.518GiB resident. Routerunit221184values match
+bitwise on2GPUs,NT1..8,captureon/off/changingweights/inputs/specialvalues.
+A local router gate1.22122x is not a whole-model speed prediction.
+CUDA test uploads explicitly complete on the consuming stream: pageable
+host `cudaMemcpy` can return before final DMA completion. The existing
+FFNpost and HCpre/RMS tests also use this ordering, with correctness-only
+CTest runs. No production upload policy changed. No new N65API checkpoint;
+server remains stopped and70tok/s remains unmet.

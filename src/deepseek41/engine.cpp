@@ -202,6 +202,7 @@ public:
     bool grouped_oa = [] { const char* v=std::getenv("STRATA_DS41_GROUPED_OA"); return v && std::atoi(v)!=0; }();
     bool route_handoff = [] { const char* v=std::getenv("STRATA_DS41_ROUTE_HANDOFF"); return v && std::atoi(v)!=0; }();
     bool tp_graph = [] { const char* v=std::getenv("STRATA_DS41_TP_GRAPH"); return v && std::atoi(v)!=0; }();
+    bool router_pipe = [] { const char* v=std::getenv("STRATA_DS41_ROUTER_PIPE4"); return v && std::atoi(v)!=0; }();
     bool hc_pre_norm = [] { const char* v=std::getenv("STRATA_DS41_HC_PRE_NORM"); return v && std::atoi(v)!=0; }();
     bool ffn_post_fuse = [] { const char* v=std::getenv("STRATA_DS41_FFN_POST_FUSE"); return v && std::atoi(v)!=0; }();
     bool ffn_graph = [] { const char* v=std::getenv("STRATA_DS41_FFN_GRAPH"); return v && std::atoi(v)!=0; }();
@@ -239,6 +240,14 @@ public:
         *ffn_plan.p=FfnPlan{};
         std::fill_n(route_bell.p,route_bell.n,0u);
         std::fill_n(tp_ready.p,tp_ready.n,0u); *tp_abort.p=0;
+        if(router_pipe) {
+            for(int layer=0;layer<c.layers;++layer) {
+                const auto& tensor=*model.tensor(block(layer)+"ffn_gate_inp.weight").tensor;
+                if(tensor.type!=30||tensor.shape.size()!=2||tensor.shape[0]!=5120||tensor.shape[1]!=384)
+                    throw std::runtime_error("router pipeline requires original BF16 5120x384 tensors");
+            }
+            std::fprintf(stderr,"strata-deepseek41: original BF16->F32 router validated on all layers; fixed4operand load pipeline\n");
+        }
         if(hc_pre_norm && c.hidden!=5120) throw std::runtime_error("fused HC pre/RMS requires H5120");
         if(ffn_post_fuse && (!ffn_graph || !direct_ffn || hc_owner || tp_graph))
             throw std::runtime_error("fused FFN post requires original FFN graph, direct FFN, mirrored HC, CPU TP sum");
@@ -610,7 +619,11 @@ public:
     }
     void route_prepare(Rank& r,int layer,int tokens) {
         const int H=c.hidden,entries=c.top_k*tokens; const auto p=block(layer); float* x=r.f("norm",H);
-        r.mat(p+"ffn_gate_inp.weight",x,r.f("router",c.experts),tokens);
+        if(router_pipe) {
+            const auto& matrix=r.w(p+"ffn_gate_inp.weight");
+            if(matrix.type!=0)throw std::runtime_error("router pipeline requires the original F32 expansion");
+            C::router_dense_pipe4(matrix.storage->f(),x,r.f("router",c.experts),matrix.in,matrix.out,tokens,r.stream);
+        } else r.mat(p+"ffn_gate_inp.weight",x,r.f("router",c.experts),tokens);
         C::route(r.f("router",c.experts),r.weight(p+"exp_probs_b.bias"),r.buffer("route_ids",size_t(c.top_k)*4).i(),r.f("route_weights",c.top_k),c.experts,c.top_k,tokens,float(c.expert_scale),r.stream);
         if(route_handoff) K::doorbell_publish(x,r.buffers.at("route_ids")->i(),r.f("route_weights",c.top_k),
             size_t(H)*tokens,entries,r.mapped_activation,r.mapped_route_ids,nullptr,r.mapped_route_bell,r.stream);
@@ -922,6 +935,7 @@ public:
         const bool candidate_ffn_graph=ffn_graph; ffn_graph=false;
         const bool candidate_ffn_post_fuse=ffn_post_fuse; ffn_post_fuse=false;
         const bool candidate_hc_pre_norm=hc_pre_norm; hc_pre_norm=false;
+        const bool candidate_router_pipe=router_pipe; router_pipe=false;
         const bool candidate_normalize_attention=normalize_attention; normalize_attention=false;
         const bool candidate_chunked_attention=chunked_attention; chunked_attention=false;
         const bool candidate_parallel_values=parallel_values; parallel_values=false;
@@ -956,6 +970,7 @@ public:
         ffn_graph=candidate_ffn_graph;
         ffn_post_fuse=candidate_ffn_post_fuse;
         hc_pre_norm=candidate_hc_pre_norm;
+        router_pipe=candidate_router_pipe;
         normalize_attention=candidate_normalize_attention;
         chunked_attention=candidate_chunked_attention;
         parallel_values=candidate_parallel_values;
