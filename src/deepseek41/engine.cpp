@@ -231,6 +231,7 @@ public:
     bool hc_norm_q8=[] {const char* v=std::getenv("STRATA_DS41_HC_NORM_Q8");return v && std::atoi(v)!=0;}();
     bool norm_q8_first=[] {const char* v=std::getenv("STRATA_DS41_NORM_Q8_FIRST");return v&&std::atoi(v)!=0;}();
     bool query_reuse=[] {const char* v=std::getenv("STRATA_DS41_QUERY_REUSE");return v&&std::atoi(v)!=0;}();
+    bool qk_pair_keys=[] {const char* v=std::getenv("STRATA_DS41_QK_PAIR_KEYS");return v&&std::atoi(v)!=0;}();
     std::vector<int> query_capacity;
     bool value_async=[] {const char* v=std::getenv("STRATA_DS41_VALUE_ASYNC64");return v&&std::atoi(v)!=0;}();
     bool index_rank_batch=[] {const char* v=std::getenv("STRATA_DS41_INDEX_RANK_BATCH");return v&&std::atoi(v)!=0;}();
@@ -343,11 +344,13 @@ public:
         std::fprintf(stderr,"strata-deepseek41: exact batched index ranking=%d; original stable score order\n",index_rank_batch ? 1 : 0);
         if(value_async && (!score_grid || !value_head_pair))throw std::runtime_error("async value staging requires original score-grid and paired-head path");
         std::fprintf(stderr,"strata-deepseek41: original paired attention values async64=%d; sequential FMA unchanged\n",value_async ? 1 : 0);
+        if(qk_pair_keys && !query_reuse)throw std::runtime_error("paired QK keys require adopted query-reuse attention");
+        std::fprintf(stderr,"strata-deepseek41: original adjacent QK heads share key decode=%d\n",qk_pair_keys ? 1 : 0);
         query_capacity.assign(ranks.size(),0);
         if(query_reuse){
             if(!value_async)throw std::runtime_error("query reuse requires the adopted asynchronous paired value path");
             for(auto& rp:ranks){ck(cudaSetDevice(rp->id));int sms=0,blocks=0;
-                query_capacity.at(size_t(rp->rank))=C::attention_score_reuse_capacity(&sms,&blocks);
+                query_capacity.at(size_t(rp->rank))=(qk_pair_keys ? C::attention_score_pair_keys_capacity : C::attention_score_reuse_capacity)(&sms,&blocks);
                 std::fprintf(stderr,"strata-deepseek41: original-order QK query reuse device=%d SMs=%d blocks_per_SM=%d capacity=%d\n",rp->id,sms,blocks,query_capacity.at(size_t(rp->rank)));
             }
         }
@@ -605,7 +608,7 @@ public:
         auto attend=normalize_attention ? C::attention_positions_normalized : C::attention_positions;
         auto value_pass=prefetch_values ? C::attention_positions_values_prefetch : C::attention_positions_values;
         if(score_grid){
-            if(value_async) C::attention_positions_score_grid_async(r.f("q",D*A),r.raw[layer]->h(),ratio ? r.compressed[streams.kv_source]->h() : nullptr,
+            if(value_async) (qk_pair_keys ? C::attention_positions_score_grid_async_pair_keys : C::attention_positions_score_grid_async)(r.f("q",D*A),r.raw[layer]->h(),ratio ? r.compressed[streams.kv_source]->h() : nullptr,
                 ratio ? r.selected[streams.top_k_source]->i() : nullptr,r.weight(p+"attn_sinks.weight")+size_t(r.rank)*A,r.f("attn",D*A),
                 r.buffers.at("attention_values")->p,D,A,tokens,c.sliding_window,pos,ratio,ratio ? c.index_top_k : 0,context,c.sliding_window+Batch,r.stream,query_reuse ? query_capacity.at(size_t(r.rank)) : 0);
             else C::attention_positions_score_grid(r.f("q",D*A),r.raw[layer]->h(),ratio ? r.compressed[streams.kv_source]->h() : nullptr,
@@ -1056,6 +1059,7 @@ public:
         const bool candidate_hc_coeff_warp=hc_coeff_warp; hc_coeff_warp=false;
         const bool candidate_hc_coeff_pre=hc_coeff_pre; hc_coeff_pre=false;
         const bool candidate_query_reuse=query_reuse; query_reuse=false;
+        const bool candidate_qk_pair_keys=qk_pair_keys; qk_pair_keys=false;
         const bool candidate_value_async=value_async; value_async=false;
         const bool candidate_index_rank_batch=index_rank_batch; index_rank_batch=false;
         const bool candidate_score_grid=score_grid; score_grid=false;
@@ -1095,6 +1099,7 @@ public:
         hc_coeff_warp=candidate_hc_coeff_warp;
         hc_coeff_pre=candidate_hc_coeff_pre;
         query_reuse=candidate_query_reuse;
+        qk_pair_keys=candidate_qk_pair_keys;
         value_async=candidate_value_async;
         index_rank_batch=candidate_index_rank_batch;
         normalize_attention=candidate_normalize_attention;

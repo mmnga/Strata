@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N93 settings. From the checkout root, copy it to an ignored local file:
+N94 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -698,3 +698,42 @@ were zero, READY's three processes had zero swap, and409.518GiB residency
 passed nine times. Cache slots stayed1225/846. Original Q4_K_M/F16C,
 DSpark MXFP4, TP2/all40,24math, lookahead2 and262144/F16KV remain.
 70tok/s is unmet; server stopped, no new API checkpoint. No push.
+
+
+N94 adds `STRATA_DS41_QK_PAIR_KEYS=1`, requiring query-reuse attention.
+Adjacent QK heads share the same original FP16 key load and conversion,
+then update two independent original F32 dot recurrences. Each keeps its
+16-FMA sequence, warp reduction and scale. The original softmax and paired
+async64 value kernels, score/pointer layout and KV/index order remain
+unchanged. The separate new score kernel keeps the original score kernels
+and entry point intact. There is no global workspace or weight increase.
+
+Each device queries the new kernel's occupancy once before capture. On
+both tested GPUs this is170 SMs times4 blocks, capacity680, versus the
+original5 blocks/capacity850. Grid Z follows that capacity and the original
+row bounds; it was not chosen from timing. The default is off and the
+example enables it. Serial CHECK clears it for the reference.
+
+The fixed four-long aggregate measured **68.3706 tok/s**,4092 timed tokens /
+59.8503 seconds, versus N93's67.8192: observed **+0.8130%**. Standard
+English/Japanese measured67.0257/74.7425 and held-out English/Japanese
+60.0948/73.7170 tok/s; all four were faster. All six prompt/output ID
+sequences and DSpark accepted/offered counts matched N93. One changed
+candidate suite does not establish statistical significance.
+
+The two-GPU oracle matched96387072 new F32 outputs against original and
+adopted attention, plus1445806080 workspace bytes containing rounded
+softmax weights, key pointers, padding and tails. NT1..8, ratios0/1/2,
+nine starts and three changed captures covered distinct head queries,
+changed KV/index/positions, whole-zero inputs, signed zero, subnormals,
+FP16 extremes and sink extremes. The complete QK/softmax/value gate at
+NT3/head32/D512/ratio2/640rows used the same warm KV/query workspace. Both
+paths have three kernels; actual captured score grids and identical
+softmax/value function pointers were checked. It measured1.19634x with
+16/16 balanced pairs faster. This is a component result.
+Actual-model batch8/rollback CHECK had max_abs=0 and relative_rms=0. All
+inference disk reads and major faults were zero, READY's three processes
+had zero swap, and409.518GiB residency passed nine times. Cache slots
+stayed1225/846. Original Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math,
+lookahead2 and262144/F16KV remain.70tok/s is unmet; server stopped,
+no new API checkpoint. No push.
