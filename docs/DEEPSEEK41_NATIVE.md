@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N111 settings. From the checkout root, copy it to an ignored local file:
+N112 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -823,4 +823,52 @@ CHECK max_abs=0 and relative_rms=0; all inference disk reads and major
 faults were zero, READY's3 processes had zero swap, and409.518GiB model
 residency passed9 times. Original Q4_K_M/F16C, DSpark MXFP4, TP2/all40,
 24 math threads, lookahead2 and262144/F16 KV remain. No push.
+The70 tok/s aggregate goal remains unmet; server stopped, no new API checkpoint.
+
+
+N112 enables `STRATA_DS41_DSPARK_MARKOV_BF16=1`. Only DSpark's
+`markov_w2.weight` stays in its original BF16 storage:66191360 bytes
+instead of the132382720-byte F32 expansion. Each original256-thread
+row/token CTA expands each BF16 word by shifting its bits into F32,
+then uses the original F32 FMA and reduction order. W1, confidence,
+output norm, Q6_K head and MXFP4 experts retain their storage and math.
+
+The original confidence graph policy, including the first always offered
+token and later uncertain-prefix cutoff, is retained. The default is off;
+the option requires the existing conditional graph head and original
+H5120/V129280 geometry. After final cache allocation and before any draft
+graph capture, only W2's expanded buffer is replaced with its original
+BF16 bytes and its matrix type is recorded as BF16. Freed space is not
+redistributed: cache slots remain1225/846. The legacy F32 head is guarded
+from reading the BF16 buffer. N111's borrowed target head stays unchanged.
+
+The fixed four-long aggregate measured **69.0069 tok/s**, 4092 timed tokens / 59.2984 seconds, versus N111's 68.7809: observed **+0.3287%**. Standard EN/JA and held-out EN/JA measured 67.5283, 75.5428, 60.4821, 74.7092 tok/s. All six output sequences and DSpark accepted/offered counts matched N111. One candidate suite does not establish statistical significance.
+
+The complete conditional draft output-head gate includes HCcollapse/RMS,
+Q6_K noise logits, five-position Markov/confidence/add/greedy selection,
+picks/confidence transfers and stream drain. Fixed NT5 and confidence
+threshold0.75 with all five confident positions measured1.166275x,16/16
+balanced pairs faster on GPU1. The full Q6_K head exceeds twice L2; the
+original BF16 W2 fits the100663296-byte L2 while its F32 expansion does not.
+This describes storage capacity and a component result, not a measured
+model cache-hit rate or model speedup.
+
+Both GPUs matched27924480 primitive F32 values and90586110 complete
+pipeline F32 values plus510 IDs using the original actual Q6_K, W1, W2,
+draft norm and confidence weights. Counts1..5, every confidence cutoff,
+changed captures, actual learned confidence, all logits including skipped
+tails, last bias/gather, cleared picks and confidence were checked. The
+actual primitive includes true zero, signed zero, subnormal and finite
+extreme inputs. Captured candidate branches verify all actual W2 pointers
+and original256-thread geometry; the original opaque reference verifies
+root pointers and full outputs.
+
+All79 existing compiled GPU modules match N111 byte for byte. The new
+module's source-derived namespace differs from the measured test module,
+but both device text sections, all seven other allocated sections, semantic
+relocations and all three CUDA info sections match. Original six math
+sources/F16C remain unchanged. Actual-model CHECK max_abs=0 and relative_rms=0;
+all inference disk reads and major faults were zero, READY's3 processes
+had zero swap, and409.518GiB model residency passed9 times. Native TP2/all40,
+24 math threads, two-layer gate lookahead and262144/F16 KV remain. No push.
 The70 tok/s aggregate goal remains unmet; server stopped, no new API checkpoint.

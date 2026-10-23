@@ -1,5 +1,6 @@
 #include "strata/deepseek41/engine.hpp"
 #include "strata/deepseek41/head_pick.hpp"
+#include "strata/deepseek41/markov_bf16.hpp"
 #include "strata/deepseek41/dspark_head.hpp"
 #include "strata/deepseek41/draft_output.hpp"
 #include "strata/deepseek41/hc_coeff.hpp"
@@ -1216,6 +1217,8 @@ public:
     bool hc_coeff_warp=[] {const char* v=std::getenv("STRATA_DS41_HC_COEFF_WARP");return v && std::atoi(v)!=0;}();
     bool grouped_output=[] {const char* v=std::getenv("STRATA_DS41_DSPARK_GROUPED_OA");return v && std::atoi(v)!=0;}();
     bool conditional_head=[] {const char* v=std::getenv("STRATA_DS41_DSPARK_CONDITIONAL_HEAD");return v && std::atoi(v)!=0;}();
+    bool markov_raw=[] {const char* v=std::getenv("STRATA_DS41_DSPARK_MARKOV_BF16");return v&&std::atoi(v)!=0;}();
+    bool markov_ready=false;
     Engine* head_borrower=nullptr;
     std::vector<std::unique_ptr<DraftCaptureStream>> head_streams;
     Host<int32_t> proposals{Batch};
@@ -1243,6 +1246,8 @@ public:
         if (!std::isfinite(min_confidence) || min_confidence<0 || min_confidence>1) throw std::runtime_error("DSpark confidence threshold must be 0..1");
         if(conditional_head && (!C::conditional_draft_available() || !replay || !rank.graph_enabled || min_confidence<=0))
             throw std::runtime_error("conditional DSpark head requires CUDA13, graph replay and original confidence policy");
+        if(markov_raw&&(!conditional_head||!replay||!rank.graph_enabled||min_confidence<=0||c.hidden!=5120||c.vocab!=129280))
+            throw std::runtime_error("original BF16 Markov requires conditional graph head H5120/V129280 and original confidence policy");
         if (block_size < 1 || block_size >= Batch || mask < 0 || mask >= c.vocab) throw std::runtime_error("DSpark noise block geometry");
         ck(cudaSetDevice(rank.id)); uint64_t bytes = 0;
         for (const auto& tensor : file.tensors()) {
@@ -1292,6 +1297,19 @@ public:
     }
     ~Draft(){if(head_borrower)head_borrower->detach_greedy_head();}
     void lend_greedy_head(Engine& target){if(target.greedy_head_tp){target.enable_greedy_head(rank.w("target_output"),rank.id);head_borrower=&target;}}
+    void prepare_markov_bf16(){
+        if(!markov_raw)return;
+        auto& matrix=rank.w("markov_w2.weight");const auto* tensor=file.find("markov_w2.weight");
+        if(markov_ready||!rank.graphs.empty()||!tensor||tensor->type!=30||tensor->shape!=std::vector<uint64_t>({256,129280})||
+           matrix.type!=0||matrix.in!=256||matrix.out!=129280||matrix.storage->bytes!=132382720)
+            throw std::runtime_error("original MarkovW2 BF16 source/expanded storage required before any capture");
+        TensorRef source{&file,tensor};if(source.bytes()!=66191360)throw std::runtime_error("original Markov BF16 byte count");
+        ck(cudaSetDevice(rank.id));ck(cudaStreamSynchronize(rank.stream));
+        auto original=std::make_unique<Buffer>(rank.id,source.bytes());
+        ck(cudaMemcpy(original->p,source.data(),source.bytes(),cudaMemcpyHostToDevice));
+        matrix.storage=std::move(original);matrix.type=30;markov_ready=true;
+        std::fprintf(stderr,"strata-deepseek41: DSpark original MarkovW2 BF16=1; 66191360 bytes, original256-lane F32 FMA/reduction; cache unchanged after allocation\n");
+    }
     void allocate() {
         auto& r = rank; const int H = c.hidden, D = c.head_dim, A = c.heads, F = c.expert_ff;
         r.f("residual",H*4); r.f("flat_norm",H*4); r.f("pre",4); r.f("attn_pre",4); r.f("post",4); r.f("comb",16); r.f("mix",24);
@@ -1393,6 +1411,7 @@ public:
         r.mat("target_output",r.f("norm",H),r.f("logits",c.vocab),n);
     }
     std::vector<int32_t> propose_legacy(int anchor,int count) {
+        if(markov_raw)throw std::runtime_error("BF16 Markov requires conditional draft head");
         auto& r = rank; ck(cudaSetDevice(r.id)); const int H = c.hidden, n = std::min(count,block_size);
         int32_t ids[Batch], positions[Batch]; for (int t = 0; t < n; ++t) { ids[t] = t ? mask : anchor; positions[t] = position+t; }
         ck(cudaMemcpyAsync(r.buffer("token",4).p,ids,size_t(n)*4,cudaMemcpyHostToDevice,r.stream));
@@ -1427,11 +1446,14 @@ public:
             noise_decode(n);
             if(conditional_head){
                 const auto confidence_bias=r.matrices.find("conf_proj.bias");
-                C::DraftHeadView view{r.f("x",H),r.weight("markov_w1.weight"),r.weight("markov_w2.weight"),r.weight("conf_proj.weight"),
+                C::DraftHeadView view{r.f("x",H),r.weight("markov_w1.weight"),markov_raw?nullptr:r.weight("markov_w2.weight"),r.weight("conf_proj.weight"),
                     confidence_bias==r.matrices.end() ? nullptr : confidence_bias->second.storage->f(),
                     r.buffer("token",4).i(),r.f("logits",c.vocab),r.f("markov",256),r.f("bias",c.vocab),r.f("confidence",1),r.buffer("pick",4).i(),H,c.vocab};
                 void* bodies[5];for(int t=0;t<5;++t)bodies[t]=head_streams[t]->stream;
-                C::conditional_draft_head(view,n,min_confidence,r.stream,bodies);
+                if(markov_raw){
+                    if(!markov_ready||r.w("markov_w2.weight").type!=30)throw std::runtime_error("original BF16 Markov storage unavailable");
+                    C::conditional_draft_head_bf16(view,r.w("markov_w2.weight").storage->h(),n,min_confidence,r.stream,bodies);
+                }else C::conditional_draft_head(view,n,min_confidence,r.stream,bodies);
                 return;
             }
             const auto& w1=r.w("markov_w1.weight");
@@ -1650,6 +1672,7 @@ int run(int argc,char** argv) {
         engine.enable_chunked_attention();
         engine.enable_attention_values();
         if(draft)draft->lend_greedy_head(engine);
+        if(draft)draft->prepare_markov_bf16();
         else if(engine.greedy_head_tp)throw std::runtime_error("greedy TP head requires original DSpark copy");
         if (!serve) {
             Request r; r.maximum = maximum; r.prompt = tokens(prompt); generate(engine,r,nullptr,tokens(force),dump,draft.get(),max_drafts); return 0;
