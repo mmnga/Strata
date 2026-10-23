@@ -81,7 +81,8 @@
     "STRATA_DS41_GREEDY_HEAD_TP": "1",
     "STRATA_DS41_DSPARK_MARKOV_BF16": "1",
     "STRATA_DS41_MAIN_PRIORITY": "1",
-    "STRATA_DS41_ENGRAM_TP": "1"
+    "STRATA_DS41_ENGRAM_TP": "1",
+    "STRATA_DS41_HC_CONSUMER": "1"
   },
   "sampling": {
     "temperature": 0,

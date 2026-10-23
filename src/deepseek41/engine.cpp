@@ -6,6 +6,7 @@
 #include "strata/deepseek41/draft_output.hpp"
 #include "strata/deepseek41/hc_coeff.hpp"
 #include "strata/deepseek41/hc_coeff_pre.hpp"
+#include "strata/deepseek41/hc_consumer.hpp"
 #include "strata/deepseek41/kv_norm_rope.hpp"
 #include "strata/deepseek41/index_rank.hpp"
 #include "strata/deepseek41/attention_async.hpp"
@@ -247,6 +248,7 @@ public:
     bool hc_coeff_warp=[] {const char* v=std::getenv("STRATA_DS41_HC_COEFF_WARP");return v && std::atoi(v)!=0;}();
     bool hc_row_tokens=[] {const char* v=std::getenv("STRATA_DS41_HC_ROW_TOKENS");return v && std::atoi(v)!=0;}();
     bool hc_coeff_pre=[] {const char* v=std::getenv("STRATA_DS41_HC_COEFF_PRE");return v && std::atoi(v)!=0;}();
+    bool hc_consumer=[] {const char* v=std::getenv("STRATA_DS41_HC_CONSUMER");return v&&std::atoi(v)!=0;}();
     bool hc_norm_q8=[] {const char* v=std::getenv("STRATA_DS41_HC_NORM_Q8");return v && std::atoi(v)!=0;}();
     bool norm_q8_first=[] {const char* v=std::getenv("STRATA_DS41_NORM_Q8_FIRST");return v&&std::atoi(v)!=0;}();
     bool query_reuse=[] {const char* v=std::getenv("STRATA_DS41_QUERY_REUSE");return v&&std::atoi(v)!=0;}();
@@ -398,6 +400,16 @@ public:
             }
         }
         std::fprintf(stderr,"strata-deepseek41: original first attention HC/norm/Q81 producer=%d; FFN/draft unchanged\n",norm_q8_first ? 1 : 0);
+        if(hc_consumer){
+            if(!hc_norm_q8 || !hc_row_tokens || !hc_coeff_pre || c.hidden!=5120 || c.hc!=4 || c.layers!=40 || c.sinkhorn_iterations!=20)
+                throw std::runtime_error("consumer-owned HC requires adopted original 80 HC paths");
+            for(auto& rp:ranks)for(int l=0;l<c.layers;++l)for(const char* sub:{"attn","ffn"}){
+                const auto& m=rp->w(block(l)+"hc_"+sub+"_fn.weight");
+                if(m.type!=12 || m.in!=20480 || m.out!=24)
+                    throw std::runtime_error("consumer-owned HC requires original Q4_K 20480x24 weights");
+            }
+        }
+        std::fprintf(stderr,"strata-deepseek41: original HC consumer-owned RMS/Q81/row projection=%d; no extra workspace\n",hc_consumer ? 1 : 0);
         if(hc_coeff_pre && (!norm_q8_first || !hc_coeff_warp || !hc_pre_norm || !hc_norm_q8 || !hc_row_tokens || c.hidden!=5120 || c.hc!=4 || c.sinkhorn_iterations!=20))
             throw std::runtime_error("parallel HC coefficient/pre requires adopted exact HC and first norm/Q81 paths");
         std::fprintf(stderr,"strata-deepseek41: original independent HC coefficients and lagged pre/RMS=%d\n",hc_coeff_pre ? 1 : 0);
@@ -523,7 +535,11 @@ public:
     }
     void hc(Rank& r,int layer,const char* suffix,float* pre,int tokens = 1) {
         const auto prefix = block(layer)+"hc_"+suffix;
-        if(hc_norm_q8){
+        if(hc_consumer){
+            const auto& m=r.w(prefix+"_fn.weight");
+            K::native_deepseek41_hc_consumer(m.storage->p,r.f("residual",c.hidden*4),r.f("flat_norm",c.hidden*4),
+                r.buffers.at("q8")->p,r.f("hc_norm_inverse",1),r.f("mix",24),c.hidden*4,tokens,float(c.rms_eps),r.stream);
+        }else if(hc_norm_q8){
             const auto& m=r.w(prefix+"_fn.weight");
             const bool wide=!hc_row_tokens && r.wide_il && tokens>=5 && tokens<=8;
             const bool interleaved=!hc_row_tokens && !wide && tokens>1 && tokens<=4 && K::native_mmvq_il_supported(m.type,tokens,m.out);
@@ -1173,6 +1189,7 @@ public:
         const bool candidate_hc_row_tokens=hc_row_tokens; hc_row_tokens=false;
         const bool candidate_hc_coeff_warp=hc_coeff_warp; hc_coeff_warp=false;
         const bool candidate_hc_coeff_pre=hc_coeff_pre; hc_coeff_pre=false;
+        const bool candidate_hc_consumer=hc_consumer; hc_consumer=false;
         const bool candidate_query_reuse=query_reuse; query_reuse=false;
         const bool candidate_qk_pair_keys=qk_pair_keys; qk_pair_keys=false;
         const bool candidate_kv_norm_rope=kv_norm_rope; kv_norm_rope=false;
@@ -1215,6 +1232,7 @@ public:
         hc_row_tokens=candidate_hc_row_tokens;
         hc_coeff_warp=candidate_hc_coeff_warp;
         hc_coeff_pre=candidate_hc_coeff_pre;
+        hc_consumer=candidate_hc_consumer;
         query_reuse=candidate_query_reuse;
         qk_pair_keys=candidate_qk_pair_keys;
         kv_norm_rope=candidate_kv_norm_rope;

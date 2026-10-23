@@ -3214,6 +3214,10 @@ void grouped_il_columns(int r,const void* w,const void* x,float* y,int ni,int no
     }
 }
 } // namespace
+#if defined(STRATA_NATIVE_DEEPSEEK41)
+#include "deepseek41_hc_consumer.cuh"
+#endif
+
 void native_hc_q4_k_row_tokens(const void* weights,const void* plain,float* output,int tokens,void* stream) {
     if(!g_multi_exact)throw std::invalid_argument("HC row/token adapter requires exact columns");
     validate_shape(20480,tokens,QK);validate_pointer(weights);validate_pointer(plain);validate_pointer(output);validate_stream(stream);

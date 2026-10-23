@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N120 settings. From the checkout root, copy it to an ignored local file:
+N126 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -944,3 +944,59 @@ residency passed nine times. Native TP2/all40,24 math participants,
 original Q4_K_M/MXFP4 DSpark,depth5/confidence.75,two-layer gate lookahead,
 262144/F16 KV and reserve1536MiB remain. No push.
 The70 tok/s aggregate goal remains unmet; server stopped, no new API checkpoint.
+
+
+## N126: HC consumer with Engram TP and target priority
+
+The adopted example adds `STRATA_DS41_HC_CONSUMER=1` to N120's
+`STRATA_DS41_ENGRAM_TP=1` and `STRATA_DS41_MAIN_PRIORITY=1`. For the
+original 80 Q4_K HC projections, each 1024-thread row/token CTA performs
+the original 256-lane RMS, shared Q8_1 quantization and four-warp Q4_K dot
+in order. Row 0 alone publishes the original normalized F32, Q8_1 and
+inverse buffers. The existing coefficient/preparation consumer retains
+its code. The default is off. CHECK clears/restores the flag for its
+independent original reference. Original geometry/types and existing HC
+producer flags are validated. No new global buffers, weights or cache quota.
+
+The fixed four-long aggregate measured **70.5207 tok/s**, 4092 timed tokens
+/ 58.0255 seconds, versus N120's 69.1424: observed **+1.9934%**. All six
+prompt/output token sequences and DSpark accepted/offered counts matched
+N120 exactly. One changed-profile suite does not establish statistical
+significance.
+
+| Long prompt | tok/s |
+| --- | ---: |
+| Standard English | 68.6812 |
+| Standard Japanese | 77.5935 |
+| Held-out English | 61.6674 |
+| Held-out Japanese | 76.5862 |
+
+All 80 GPU modules are byte-identical to the previously tested N113 HC
+profile. Its complete paired HC+attention-QA / HC+FFN-router-route test
+therefore applies unchanged: 1.192455x, 16/16 pairs faster. Both GPUs,
+all 80 original HC tensors, NT1..8 and three changed controls matched
+1,092,251,520 F32 values, 1,461,043,200 Q8_1 bytes and 103,680 route IDs.
+The test and kernel/header match the measured source. No unchanged
+component timing or weight oracle was repeated. All three original CPU
+objects and six original math/F16C sources remain unchanged.
+
+Model batch/rollback CHECK max_abs=0 and relative_rms=0. All inference
+disk reads and major faults were zero, READY's three processes had zero
+swap, and 409.518 GiB RAM residency passed nine times. Cache slots remain
+1225/846 with 1536 MiB reserve per GPU. Original Q4_K_M/MXFP4 DSpark,
+native TP2/all 40 layers, 24 math participants, DSpark depth 5/confidence
+0.75, two-layer gate lookahead and 262144/F16 KV remain. No push.
+
+The fresh authenticated LAN API checkpoint passed English/Japanese chat,
+chat SSE, Responses, Anthropic Messages, forced tool calls and tool history,
+tool SSE, UI serving and unauthenticated-request rejection. A nonneutral
+temperature/presence-penalty request also passed through the original full
+head fallback. The server was left running with the same adopted binary,
+TP2, 24 math participants and context 262144.
+
+The API process, inference engine and two RAM lockers retained the same
+PIDs throughout validation. All had zero swap. The engine and RAM lockers
+had zero additional disk reads and major faults. The API Python process
+read 151552 bytes and incurred one major fault while serving these protocol
+paths; that is separate from model residency and inference I/O. The fresh
+engine log confirmed 409.518 GiB RAM residency. No push.
