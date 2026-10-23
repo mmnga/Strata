@@ -7,6 +7,7 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 namespace C=strata::deepseek41::cuda;
 void ck(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));}
@@ -19,7 +20,7 @@ void run(int device,bool gate){
  {
  B residual(size_t(Max)*4*4),pre(4*8*4),weight(Width*4),x[2]={B(Max*4),B(Max*4)},y[2]={B(Max*4),B(Max*4)};
  H hx[2]={H(Max),H(Max)},hy[2]={H(Max),H(Max)};
- auto upload=[&](B& dst,size_t n,float phase){std::vector<float> v(n);for(size_t i=0;i<n;++i){v[i]=std::sin(float(i)*.113f+phase)*.3f;if(i%47==0)v[i]=-0.0f;if(i%71==0)v[i]=std::ldexp(float(int(i%7)-3),-140);}ck(cudaMemcpy(dst.p,v.data(),n*4,cudaMemcpyHostToDevice));};
+ auto upload=[&](B& dst,size_t n,float phase){std::vector<float> v(n);for(size_t i=0;i<n;++i){v[i]=std::sin(float(i)*.113f+phase)*.3f;if(i%47==0)v[i]=-0.0f;if(i%71==0)v[i]=std::ldexp(float(int(i%7)-3),-140);}ck(cudaMemcpyAsync(dst.p,v.data(),n*4,cudaMemcpyHostToDevice,stream));ck(cudaStreamSynchronize(stream));};
  auto body=[&](int t,int variant,bool timing){
   if(variant)C::hc_pre_rms(residual.f(),pre.f(),weight.f(),x[variant].f(),y[variant].f(),Width,t,1e-6f,stream);
   else{C::hc_pre(residual.f(),pre.f(),x[variant].f(),Width,t,stream);C::rms(x[variant].f(),weight.f(),y[variant].f(),Width,t,1e-6f,stream);}
@@ -45,4 +46,4 @@ void run(int device,bool gate){
  }
  ck(cudaStreamDestroy(stream));
 }
-int main(){try{run(0,true);run(1,false);}catch(const std::exception&e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(int argc,char** argv){try{const bool correctness_only=argc==2&&std::string(argv[1])=="--correctness-only";run(0,!correctness_only);run(1,false);}catch(const std::exception&e){std::cerr<<e.what()<<'\n';return 1;}}

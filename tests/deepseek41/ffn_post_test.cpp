@@ -7,6 +7,7 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 namespace C=strata::deepseek41::cuda;
 void ck(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));}
@@ -21,7 +22,7 @@ void run(int device,bool gate){
  B residual[2]={B(size_t(Max)*4*4),B(size_t(Max)*4*4)},out[2]={B(Max*4),B(Max*4)};
  H cpu(size_t(Max)*Top),ffn[2]={H(Max),H(Max)},hc[2]={H(size_t(Max)*4),H(size_t(Max)*4)};
  float*mapped=nullptr;ck(cudaHostGetDevicePointer(&mapped,cpu.p,0));
- auto upload=[&](B& dst,size_t n,float phase){std::vector<float> v(n);for(size_t i=0;i<n;++i){v[i]=std::sin(float(i)*0.137f+phase)*0.25f;if(i%47==0)v[i]=-0.0f;if(i%71==0)v[i]=std::ldexp(float(int(i%7)-3),-140);}ck(cudaMemcpy(dst.p,v.data(),n*4,cudaMemcpyHostToDevice));};
+ auto upload=[&](B& dst,size_t n,float phase){std::vector<float> v(n);for(size_t i=0;i<n;++i){v[i]=std::sin(float(i)*0.137f+phase)*0.25f;if(i%47==0)v[i]=-0.0f;if(i%71==0)v[i]=std::ldexp(float(int(i%7)-3),-140);}ck(cudaMemcpyAsync(dst.p,v.data(),n*4,cudaMemcpyHostToDevice,stream));ck(cudaStreamSynchronize(stream));};
  upload(parts,size_t(Max)*Top,.1f);upload(weights,Top*8,.2f);upload(shared,Max,.3f);upload(initial,size_t(Max)*4,.4f);upload(post,4*8,.5f);upload(comb,16*8,.6f);
  auto body=[&](int tokens,int variant,bool timing){int n=Width*tokens;
   ck(cudaMemcpyAsync(residual[variant].p,initial.p,size_t(n)*4*4,cudaMemcpyDeviceToDevice,stream));
@@ -37,7 +38,7 @@ void run(int device,bool gate){
   G graphs[2];if(capture)for(int v=0;v<2;++v){ck(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));body(tokens,v,false);ck(cudaStreamEndCapture(stream,&graphs[v].g));ck(cudaGraphInstantiate(&graphs[v].e,graphs[v].g,nullptr,nullptr,0));}
   for(int replay=0;replay<12;++replay){
    uint64_t bits=0;for(int row=0;row<Top*tokens;++row)if(replay%3==1||(replay%3==2&&row%2==0))bits|=uint64_t(1)<<row;
-   ck(cudaMemcpy(mask.p,&bits,8,cudaMemcpyHostToDevice));
+   ck(cudaMemcpyAsync(mask.p,&bits,8,cudaMemcpyHostToDevice,stream));ck(cudaStreamSynchronize(stream));
    for(size_t i=0;i<size_t(tokens)*Top*Width;++i){float v=std::sin(float(i)*.117f+float(replay)*.2f);if(i%17==0)v=-0.0f;if(i%23==0)v=std::ldexp(float(int(i%7)-3),-140);cpu.p[i]=v;}
    std::atomic_thread_fence(std::memory_order_release);
    for(int v=0;v<2;++v){if(capture)ck(cudaGraphLaunch(graphs[v].e,stream));else body(tokens,v,false);ck(cudaStreamSynchronize(stream));}
@@ -46,7 +47,7 @@ void run(int device,bool gate){
  }
  std::cout<<"device="<<device<<" original combine+HC vs fused bitwise PASS values="<<compared<<" NT1..8 captureon/off masksnone/all/mixed changingCPU signedzero/subnormal inplaceHC\n";
  if(gate){
-  constexpr int tokens=3,n=Width*tokens;G graphs[2];uint64_t bits=0;for(int row=0;row<Top*tokens;++row)if(row%2==0)bits|=uint64_t(1)<<row;ck(cudaMemcpy(mask.p,&bits,8,cudaMemcpyHostToDevice));
+  constexpr int tokens=3,n=Width*tokens;G graphs[2];uint64_t bits=0;for(int row=0;row<Top*tokens;++row)if(row%2==0)bits|=uint64_t(1)<<row;ck(cudaMemcpyAsync(mask.p,&bits,8,cudaMemcpyHostToDevice,stream));ck(cudaStreamSynchronize(stream));
   for(int v=0;v<2;++v){ck(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));body(tokens,v,true);ck(cudaStreamEndCapture(stream,&graphs[v].g));ck(cudaGraphInstantiate(&graphs[v].e,graphs[v].g,nullptr,nullptr,0));}
   auto launch=[&](int v){ck(cudaGraphLaunch(graphs[v].e,stream));ck(cudaStreamSynchronize(stream));};
   for(int i=0;i<16;++i)launch(i%2);
@@ -57,4 +58,4 @@ void run(int device,bool gate){
  }
  ck(cudaStreamDestroy(stream));
 }
-int main(){try{run(0,true);run(1,false);}catch(const std::exception&e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(int argc,char** argv){try{const bool correctness_only=argc==2&&std::string(argv[1])=="--correctness-only";run(0,!correctness_only);run(1,false);}catch(const std::exception&e){std::cerr<<e.what()<<'\n';return 1;}}
