@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N96 settings. From the checkout root, copy it to an ignored local file:
+N111 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -780,3 +780,47 @@ and major faults were zero, READY's three processes had zero swap, and
 Original Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math, lookahead2 and
 262144/F16KV remain.70tok/s is unmet; server stopped, no new API checkpoint.
 No push.
+
+
+N111 enables `STRATA_DS41_GREEDY_HEAD_TP=1` for requests with neutral
+greedy sampling. GPU0 computes vocabulary rows0..64639 and GPU1 computes
+rows64640..129279, using the original Q6_K dot, Q8_1/IL/wide dispatch and
+sampler. GPU1 borrows the identical full target head already loaded by
+DSpark. The draft stays on GPU1 and no head weight copy or repacking is
+added. Both engine ranks use their original residual/pre state and output
+normalization. Only local selected scores and IDs cross to the CPU; the
+merge preserves the lower global ID for ties. No peer access is required.
+
+The option defaults off. Temperature sampling, nonneutral penalties,
+logit bias, forced tokens, full-logit dumps and CHECK retain the original
+full head on GPU0. A request guard clears the accelerated mode on normal
+and exceptional exits. Original row picks remain valid after retaining a
+verified prefix and are invalidated for each new process/reset. Partial
+logits cannot enter the ordinary sampler. Draft teardown drains the engine
+head streams and detaches the borrow before uniquely owned weights die.
+
+After final cache allocation, GPU1 loads the original F32 output norm
+(20KiB) and allocates a half-logit buffer (2068480 bytes) and small pick
+metadata from the existing1536MiB reserve; GPU0 reuses its full-logit buffer.
+Expert cache slots stay1225/846. No new captured head graph is introduced.
+
+The fixed four-long aggregate measured **68.7809 tok/s**, 4092 timed tokens / 59.4933 seconds, versus N96's 68.5252: observed **+0.3732%**. Standard EN/JA and held-out EN/JA measured 67.2823, 75.3819, 60.2946, 74.3940 tok/s. All six output sequences and DSpark accepted/offered counts matched N96. One changed-candidate suite does not establish statistical significance.
+
+The complete serial HCcollapse/RMS/quant/head/greedy/CPU acquisition gate
+includes all device switches, launch APIs, stream drains, selected-score
+transfers and CPU merge. Fixed NT3 measured1.882639x,16/16 balanced pairs
+faster. The full542976000-byte head and each271488000-byte half exceed
+twice each GPU's L2. Both GPUs matched44,651,520 F32 values,9,964,800
+quant bytes and456 IDs with the original actual head/norm weights.
+NT1..8, three changed captures, full-versus-both-halves on each GPU,
+cross-GPU all-logit controls, output guards and weight-offset dispatch were
+checked. Independent boundary/tie/signed-zero/NaN/infinity/all-NaN/all-inf/
+last-row controls matched the original sampler. This is a component result.
+
+All78 existing compiled CUDA modules, including constants and relocations,
+match N96 byte for byte; one score-gather-only module is added. Actual-model
+CHECK max_abs=0 and relative_rms=0; all inference disk reads and major
+faults were zero, READY's3 processes had zero swap, and409.518GiB model
+residency passed9 times. Original Q4_K_M/F16C, DSpark MXFP4, TP2/all40,
+24 math threads, lookahead2 and262144/F16 KV remain. No push.
+The70 tok/s aggregate goal remains unmet; server stopped, no new API checkpoint.

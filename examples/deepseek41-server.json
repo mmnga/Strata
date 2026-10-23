@@ -77,7 +77,8 @@
     "STRATA_DS41_ROUTE_WARP": "1",
     "STRATA_DS41_HC_COEFF_PRE": "1",
     "STRATA_DS41_QK_PAIR_KEYS": "1",
-    "STRATA_DS41_KV_NORM_ROPE": "1"
+    "STRATA_DS41_KV_NORM_ROPE": "1",
+    "STRATA_DS41_GREEDY_HEAD_TP": "1"
   },
   "sampling": {
     "temperature": 0,

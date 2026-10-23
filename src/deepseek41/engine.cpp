@@ -1,4 +1,5 @@
 #include "strata/deepseek41/engine.hpp"
+#include "strata/deepseek41/head_pick.hpp"
 #include "strata/deepseek41/dspark_head.hpp"
 #include "strata/deepseek41/draft_output.hpp"
 #include "strata/deepseek41/hc_coeff.hpp"
@@ -234,6 +235,12 @@ public:
     bool query_reuse=[] {const char* v=std::getenv("STRATA_DS41_QUERY_REUSE");return v&&std::atoi(v)!=0;}();
     bool qk_pair_keys=[] {const char* v=std::getenv("STRATA_DS41_QK_PAIR_KEYS");return v&&std::atoi(v)!=0;}();
     bool kv_norm_rope=[] {const char* v=std::getenv("STRATA_DS41_KV_NORM_ROPE");return v&&std::atoi(v)!=0;}();
+    bool greedy_head_tp=[] {const char* v=std::getenv("STRATA_DS41_GREEDY_HEAD_TP");return v&&std::atoi(v)!=0;}();
+    bool head_request=false,head_valid=false;
+    int head_rows=0;
+    const void* head_peer_weights=nullptr; // Draft's unique owner detaches before freeing it.
+    std::unique_ptr<Host<HeadPick>> head_pairs;
+    std::array<int32_t,Batch> head_ids{};
     std::vector<int> query_capacity;
     bool value_async=[] {const char* v=std::getenv("STRATA_DS41_VALUE_ASYNC64");return v&&std::atoi(v)!=0;}();
     bool index_rank_batch=[] {const char* v=std::getenv("STRATA_DS41_INDEX_RANK_BATCH");return v&&std::atoi(v)!=0;}();
@@ -707,8 +714,48 @@ public:
         }
         r.launch(layer,1,tokens,[&] { attention_output(r,layer,tokens); });
     }
+    void enable_greedy_head(const Matrix& peer,int peer_device) {
+        if(!greedy_head_tp) return;
+        const auto& original=ranks[0]->w("output.weight");const auto& norm=ranks[0]->w("output_norm.weight");
+        const auto source=model.tensor("output.weight"),gamma=model.tensor("output_norm.weight");
+        if(ranks.size()!=2||ranks[0]->id!=0||ranks[1]->id!=1||peer_device!=1||c.hidden!=5120||c.vocab!=129280||hc_owner||overlap_ffn||
+           original.type!=14||peer.type!=14||original.in!=5120||peer.in!=5120||original.out!=129280||peer.out!=129280||
+           original.storage->bytes!=542976000||peer.storage->bytes!=542976000||norm.type!=0||norm.in!=5120||norm.out!=1||
+           source.tensor->type!=14||gamma.tensor->type!=0||head_peer_weights)
+            throw std::runtime_error("greedy TP head requires original mirrored TP2 H5120/V129280 Q6_K head and F32 norm");
+        // Allocate after the unchanged expert cache, from its existing reserve.
+        auto& second=*ranks[1];ck(cudaSetDevice(second.id));
+        second.load("output_norm.weight",gamma,c);second.f("head_logits",c.vocab/2);second.buffer("pick",4);
+        for(auto& rp:ranks){auto& r=*rp;ck(cudaSetDevice(r.id));r.buffer("head_pair",sizeof(HeadPick));
+            K::SamplerParams params;params.greedy=true;params.temperature=0;
+            float* logits=r.rank?r.f("head_logits",c.vocab/2):r.f("logits",c.vocab);
+            ck(cudaMemsetAsync(logits,0,size_t(c.vocab/2)*4,r.stream));
+            K::sample_tokens(logits,1,c.vocab/2,nullptr,0,params,r.buffer("pick",4).i(),r.stream);ck(cudaStreamSynchronize(r.stream));}
+        head_pairs=std::make_unique<Host<HeadPick>>(2*Batch,cudaHostAllocPortable);
+        head_peer_weights=peer.storage->p;
+        std::fprintf(stderr,"strata-deepseek41: greedy target head TP=1; original rows64640/device, existing DSpark Q6_K copy borrowed, original F32 norm20KiB and head scratch from reserve; nonneutral/dump/CHECK original path\n");
+    }
+    void detach_greedy_head() noexcept {
+        // The Draft destructor runs before its uniquely owned weight buffers die.
+        for(auto& r:ranks){cudaSetDevice(r->id);cudaStreamSynchronize(r->stream);}
+        head_peer_weights=nullptr;head_request=false;head_valid=false;head_rows=0;
+    }
+    void enqueue_greedy_head(int tokens) {
+        if(!head_peer_weights||!head_pairs||ranks.size()!=2)throw std::runtime_error("greedy head source unavailable");
+        const int half=c.vocab/2;K::SamplerParams params;params.greedy=true;params.temperature=0;
+        for(auto& rp:ranks){auto& r=*rp;ck(cudaSetDevice(r.id));
+            C::hc_pre(r.f("residual",c.hidden*4),r.f("pre",4),r.f("x",c.hidden),c.hidden,tokens,r.stream);
+            r.norm("output_norm.weight",r.f("x",c.hidden),r.f("norm",c.hidden),c.hidden,float(c.rms_eps),tokens);
+            const void* weights=r.rank?static_cast<const uint8_t*>(head_peer_weights)+271488000:r.w("output.weight").storage->p;
+            float* logits=r.rank?r.f("head_logits",half):r.f("logits",c.vocab);
+            r.quant_mat(14,weights,r.f("norm",c.hidden),logits,c.hidden,half,tokens);
+            K::sample_tokens(logits,tokens,half,nullptr,0,params,r.buffer("pick",4).i(),r.stream);
+            gather_head_picks(logits,r.buffer("pick",4).i(),static_cast<HeadPick*>(r.buffers.at("head_pair")->p),tokens,half,r.rank*half,r.stream);
+            ck(cudaMemcpyAsync(head_pairs->p+r.rank*Batch,r.buffers.at("head_pair")->p,size_t(tokens)*sizeof(HeadPick),cudaMemcpyDeviceToHost,r.stream));
+        }
+    }
     void sync() { for (auto& r : ranks) { ck(cudaSetDevice(r->id)); ck(cudaStreamSynchronize(r->stream)); } }
-    void reset() { sync(); position = 0; history.clear(); }
+    void reset() { sync(); head_valid=false;head_rows=0; position = 0; history.clear(); }
     void engram(int layer,const int32_t* inputs,int tokens) {
         const int eg = model.streams()[layer].engram_index;
         if (eg < 0) return;
@@ -960,6 +1007,7 @@ public:
         if((tp_graph || ffn_graph) && *tp_abort.p) throw std::runtime_error("native mapped graph aborted");
         if (tokens < 1 || tokens > Batch || position+tokens > context) throw std::runtime_error("native token/context out of range");
         for (int t = 0; t < tokens; ++t) if (inputs[t] < 0 || inputs[t] >= c.vocab) throw std::runtime_error("invalid native input token");
+        head_valid=false;head_rows=0;
         speculative = verify;
         const int H = c.hidden;
         int32_t pos[Batch], comp_pos[Batch];
@@ -1001,13 +1049,16 @@ public:
             }
             ffn(layer,tokens);
         }
-        if (output) {
+        if(output && head_request) enqueue_greedy_head(tokens);
+        else if (output) {
             ck(cudaSetDevice(first.id));
             C::hc_pre(first.f("residual",H*4),first.f("pre",4),first.f("x",H),H,tokens,first.stream);
             first.norm("output_norm.weight",first.f("x",H),first.f("norm",H),H,float(c.rms_eps),tokens);
             first.mat("output.weight",first.f("norm",H),first.f("logits",c.vocab),tokens);
         }
-        sync(); history.insert(history.end(),inputs,inputs+tokens); position += tokens; last_rows = tokens;
+        sync();
+        if(output&&head_request){merge_head_picks(head_pairs->p,head_pairs->p+Batch,tokens,c.vocab,head_ids.data());head_valid=true;head_rows=tokens;}
+        history.insert(history.end(),inputs,inputs+tokens); position += tokens; last_rows = tokens;
     }
     void step(int32_t token,bool output = true) { process(&token,1,output); }
     void retain(int count) {
@@ -1019,12 +1070,18 @@ public:
         position -= last_rows-count; history.resize(size_t(position)); last_rows = count; speculative = false;
     }
     std::vector<int32_t> greedy_rows() {
+        if(head_request){if(!head_valid||last_rows>head_rows)throw std::runtime_error("greedy head picks invalid");return {head_ids.begin(),head_ids.begin()+last_rows};}
         auto& r = *ranks[0]; ck(cudaSetDevice(r.id)); K::SamplerParams params; params.greedy = true; params.temperature = 0;
         K::sample_tokens(r.f("logits",c.vocab),last_rows,c.vocab,nullptr,0,params,r.buffer("pick",4).i(),r.stream);
         ck(cudaMemcpyAsync(picked.p,r.buffer("pick",4).p,size_t(last_rows)*4,cudaMemcpyDeviceToHost,r.stream)); ck(cudaStreamSynchronize(r.stream));
         return std::vector<int32_t>(picked.p,picked.p+last_rows);
     }
     int sample(K::SamplerParams params = {}) {
+        if(head_request){
+            const bool neutral=params.penalty_last_n<=0||(params.penalty_repeat==1&&params.penalty_freq==0&&params.penalty_present==0);
+            if(!params.greedy||!neutral||params.logit_bias||!head_valid||last_rows>head_rows)throw std::runtime_error("partial head cannot serve nonneutral sampling");
+            return head_ids[size_t(last_rows-1)];
+        }
         auto& r = *ranks[0]; ck(cudaSetDevice(r.id));
         const int n = std::min(int(history.size()),params.penalty_last_n);
         if (n) ck(cudaMemcpyAsync(r.buffer("penalty_history",size_t(context)*4).p,history.data()+history.size()-size_t(n),size_t(n)*4,cudaMemcpyHostToDevice,r.stream));
@@ -1034,6 +1091,7 @@ public:
         return *picked.p;
     }
     void dump(const std::string& path) {
+        if(head_request)throw std::runtime_error("full logit dump requires original head");
         auto& r = *ranks[0]; ck(cudaSetDevice(r.id)); std::vector<float> logits(c.vocab);
         ck(cudaMemcpy(logits.data(),r.f("logits",c.vocab)+size_t(last_rows-1)*c.vocab,logits.size()*4,cudaMemcpyDeviceToHost));
         std::ofstream out(path,std::ios::binary); out.write(reinterpret_cast<const char*>(logits.data()),std::streamsize(logits.size()*4));
@@ -1158,6 +1216,7 @@ public:
     bool hc_coeff_warp=[] {const char* v=std::getenv("STRATA_DS41_HC_COEFF_WARP");return v && std::atoi(v)!=0;}();
     bool grouped_output=[] {const char* v=std::getenv("STRATA_DS41_DSPARK_GROUPED_OA");return v && std::atoi(v)!=0;}();
     bool conditional_head=[] {const char* v=std::getenv("STRATA_DS41_DSPARK_CONDITIONAL_HEAD");return v && std::atoi(v)!=0;}();
+    Engine* head_borrower=nullptr;
     std::vector<std::unique_ptr<DraftCaptureStream>> head_streams;
     Host<int32_t> proposals{Batch};
     Host<float> confidence{Batch};
@@ -1231,6 +1290,8 @@ public:
         std::fprintf(stderr,"strata-deepseek41: DSpark graph=%d confidence_min=%.2f original noise block=%d\n",replay ? 1 : 0,min_confidence,block_size);
         std::fprintf(stderr,"strata-deepseek41: native DSpark device=%d stages=3 block=%d mask=%d target_layers=37,38,39, original MXFP4, %.3f GiB draft weights\n",rank.id,block_size,mask,double(bytes)/(1ull<<30));
     }
+    ~Draft(){if(head_borrower)head_borrower->detach_greedy_head();}
+    void lend_greedy_head(Engine& target){if(target.greedy_head_tp){target.enable_greedy_head(rank.w("target_output"),rank.id);head_borrower=&target;}}
     void allocate() {
         auto& r = rank; const int H = c.hidden, D = c.head_dim, A = c.heads, F = c.expert_ff;
         r.f("residual",H*4); r.f("flat_norm",H*4); r.f("pre",4); r.f("attn_pre",4); r.f("post",4); r.f("comb",16); r.f("mix",24);
@@ -1484,6 +1545,8 @@ void generate(Engine& e,const Request& request,Control* control,const std::vecto
     if (request.draft_depth >= 0) max_drafts = request.draft_depth;
     const bool neutral = sampling.penalty_last_n <= 0 || (sampling.penalty_repeat == 1 && sampling.penalty_freq == 0 && sampling.penalty_present == 0);
     Draft* active = draft && max_drafts && sampling.greedy && neutral && forced.empty() ? draft : nullptr;
+    struct HeadRequestGuard{Engine& e;~HeadRequestGuard(){e.head_request=false;e.head_valid=false;e.head_rows=0;}} head_guard{e};
+    e.head_request=e.greedy_head_tp&&e.head_peer_weights&&sampling.greedy&&neutral&&!sampling.logit_bias&&forced.empty()&&dump.empty();
     e.reset(); const auto prompt_start = Clock::now();
     if (active) active->reset();
     size_t read = 0; bool stopped = false;
@@ -1586,6 +1649,8 @@ int run(int argc,char** argv) {
         engine.enable_streamed();
         engine.enable_chunked_attention();
         engine.enable_attention_values();
+        if(draft)draft->lend_greedy_head(engine);
+        else if(engine.greedy_head_tp)throw std::runtime_error("greedy TP head requires original DSpark copy");
         if (!serve) {
             Request r; r.maximum = maximum; r.prompt = tokens(prompt); generate(engine,r,nullptr,tokens(force),dump,draft.get(),max_drafts); return 0;
         }
