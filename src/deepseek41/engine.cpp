@@ -5,6 +5,7 @@
 #include "strata/deepseek41/index_rank.hpp"
 #include "strata/deepseek41/attention_async.hpp"
 #include "strata/deepseek41/norm_quant.hpp"
+#include "strata/deepseek41/route_warp.hpp"
 #include "strata/deepseek41/model.hpp"
 #include "strata/deepseek41/resident.hpp"
 #include "strata/deepseek41/cpu_experts.hpp"
@@ -214,6 +215,7 @@ public:
     bool route_handoff = [] { const char* v=std::getenv("STRATA_DS41_ROUTE_HANDOFF"); return v && std::atoi(v)!=0; }();
     bool tp_graph = [] { const char* v=std::getenv("STRATA_DS41_TP_GRAPH"); return v && std::atoi(v)!=0; }();
     bool router_pipe = [] { const char* v=std::getenv("STRATA_DS41_ROUTER_PIPE4"); return v && std::atoi(v)!=0; }();
+    bool route_warp = [] {const char* v=std::getenv("STRATA_DS41_ROUTE_WARP");return v && std::atoi(v)!=0;}();
     bool hc_pre_norm = [] { const char* v=std::getenv("STRATA_DS41_HC_PRE_NORM"); return v && std::atoi(v)!=0; }();
     bool ffn_post_fuse = [] { const char* v=std::getenv("STRATA_DS41_FFN_POST_FUSE"); return v && std::atoi(v)!=0; }();
     bool ffn_graph = [] { const char* v=std::getenv("STRATA_DS41_FFN_GRAPH"); return v && std::atoi(v)!=0; }();
@@ -259,6 +261,8 @@ public:
         *ffn_plan.p=FfnPlan{};
         std::fill_n(route_bell.p,route_bell.n,0u);
         std::fill_n(tp_ready.p,tp_ready.n,0u); *tp_abort.p=0;
+        if(route_warp && (c.experts!=384 || c.top_k!=6))throw std::runtime_error("warp route requires original384/top6 target");
+        std::fprintf(stderr,"strata-deepseek41: original sqrt-softplus/bias stable warp route=%d\n",route_warp ? 1 : 0);
         if(router_pipe) {
             for(int layer=0;layer<c.layers;++layer) {
                 const auto& tensor=*model.tensor(block(layer)+"ffn_gate_inp.weight").tensor;
@@ -716,7 +720,7 @@ public:
             if(matrix.type!=0)throw std::runtime_error("router pipeline requires the original F32 expansion");
             C::router_dense_pipe4(matrix.storage->f(),x,r.f("router",c.experts),matrix.in,matrix.out,tokens,r.stream);
         } else r.mat(p+"ffn_gate_inp.weight",x,r.f("router",c.experts),tokens);
-        C::route(r.f("router",c.experts),r.weight(p+"exp_probs_b.bias"),r.buffer("route_ids",size_t(c.top_k)*4).i(),r.f("route_weights",c.top_k),c.experts,c.top_k,tokens,float(c.expert_scale),r.stream);
+        (route_warp ? C::route_warp : C::route)(r.f("router",c.experts),r.weight(p+"exp_probs_b.bias"),r.buffer("route_ids",size_t(c.top_k)*4).i(),r.f("route_weights",c.top_k),c.experts,c.top_k,tokens,float(c.expert_scale),r.stream);
         if(route_handoff) K::doorbell_publish(x,r.buffers.at("route_ids")->i(),r.f("route_weights",c.top_k),
             size_t(H)*tokens,entries,r.mapped_activation,r.mapped_route_ids,nullptr,r.mapped_route_bell,r.stream);
         else {
@@ -1028,6 +1032,7 @@ public:
         const bool candidate_ffn_post_fuse=ffn_post_fuse; ffn_post_fuse=false;
         const bool candidate_hc_pre_norm=hc_pre_norm; hc_pre_norm=false;
         const bool candidate_router_pipe=router_pipe; router_pipe=false;
+        const bool candidate_route_warp=route_warp; route_warp=false;
         const bool candidate_normalize_attention=normalize_attention; normalize_attention=false;
         const bool candidate_chunked_attention=chunked_attention; chunked_attention=false;
         const bool candidate_parallel_values=parallel_values; parallel_values=false;
@@ -1070,6 +1075,7 @@ public:
         ffn_post_fuse=candidate_ffn_post_fuse;
         hc_pre_norm=candidate_hc_pre_norm;
         router_pipe=candidate_router_pipe;
+        route_warp=candidate_route_warp;
         norm_q8_first=candidate_norm_q8_first;
         hc_norm_q8=candidate_hc_norm_q8;
         hc_row_tokens=candidate_hc_row_tokens;
@@ -1114,6 +1120,7 @@ public:
     bool replay = [] { const char* v=std::getenv("STRATA_DS41_DSPARK_GRAPH"); return v && std::atoi(v)!=0; }();
     bool mxfp4_alu = [] { const char* v=std::getenv("STRATA_DS41_MXFP4_ALU"); return v && std::atoi(v)!=0; }();
     bool mxfp4_pipe = [] { const char* v=std::getenv("STRATA_DS41_MXFP4_PIPE4"); return v && std::atoi(v)!=0; }();
+    bool route_warp = [] {const char* v=std::getenv("STRATA_DS41_ROUTE_WARP");return v && std::atoi(v)!=0;}();
     float min_confidence = [] { const char* v=std::getenv("STRATA_DS41_DSPARK_P_MIN"); return v ? std::stof(v) : 0.0f; }();
     bool hc_coeff_warp=[] {const char* v=std::getenv("STRATA_DS41_HC_COEFF_WARP");return v && std::atoi(v)!=0;}();
     bool grouped_output=[] {const char* v=std::getenv("STRATA_DS41_DSPARK_GROUPED_OA");return v && std::atoi(v)!=0;}();
@@ -1163,6 +1170,7 @@ public:
         }
         if (mxfp4_pipe && (c.hidden%128 || c.expert_ff%128)) throw std::runtime_error("DSpark pipelined MXFP4 requires original 128-aligned widths");
         std::fprintf(stderr,"strata-deepseek41: DSpark original MXFP4 four-block operand pipeline=%d\n",mxfp4_pipe ? 1 : 0);
+        std::fprintf(stderr,"strata-deepseek41: original DSpark128/top3 stable warp route=%d\n",route_warp ? 1 : 0);
         if(conditional_head){
             const auto& w1=rank.w("markov_w1.weight");const auto& w2=rank.w("markov_w2.weight");
             if(w1.type!=0 || w2.type!=0 || w1.in!=256 || w2.in!=256 || w1.out!=c.vocab || w2.out!=c.vocab)
@@ -1264,7 +1272,7 @@ public:
     void ffn(int l,int n) {
         auto& r = rank; const auto p = block(l); const int H = c.hidden, F = c.expert_ff;
         r.mat(p+"ffn_gate_inp.weight",r.f("norm",H),r.f("router",c.experts),n);
-        C::route(r.f("router",c.experts),r.weight(p+"exp_probs_b.bias"),r.buffer("route_ids",size_t(c.top_k)*4).i(),r.f("route_weights",c.top_k),c.experts,c.top_k,n,float(c.expert_scale),r.stream);
+        (route_warp ? C::route_warp : C::route)(r.f("router",c.experts),r.weight(p+"exp_probs_b.bias"),r.buffer("route_ids",size_t(c.top_k)*4).i(),r.f("route_weights",c.top_k),c.experts,c.top_k,n,float(c.expert_scale),r.stream);
         r.mat(p+"ffn_gate_shexp.weight",r.f("norm",H),r.f("gate",F),n); r.mat(p+"ffn_up_shexp.weight",r.f("norm",H),r.f("up",F),n);
         C::swiglu(r.f("gate",F),r.f("up",F),r.f("hidden",F),n*F,float(c.clamp_shared[l]),r.stream);
         r.mat(p+"ffn_down_shexp.weight",r.f("hidden",F),r.f("shared",H),n);

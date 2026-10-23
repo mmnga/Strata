@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N89 settings. From the checkout root, copy it to an ignored local file:
+N91 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -621,3 +621,39 @@ and409.518GiB residency passed nine times. Cache slots stayed1225/846.
 Original Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math, lookahead2 and
 262144/F16KV remain.70tok/s is still unmet; server stopped, no new API
 checkpoint. No push.
+
+
+N91 adds `STRATA_DS41_ROUTE_WARP=1` for target384/top6 and DSpark128/top3
+routing. It reuses Qwen's register-resident candidate and stable warp
+argmax structure. Each token uses one32-thread CTA instead of the
+original256-thread selection with block barriers. DeepSeek retains its
+original sqrt(softplus(logit)) probabilities, bias for ranking, ascending
+expert ID on ties, unbiased selected probabilities and rank-ordered F32
+weight sum, clamp and scale. Qwen's softmax and lane-ordered sum are not
+used. The original route is unchanged by default. The example enables
+the new path for both models; serial CHECK clears it for the reference.
+No buffers, weight copies, cache reservations or placement policy change.
+
+The fixed four-long aggregate measured **67.4701 tok/s**,4092 timed tokens /
+60.6491 seconds, versus N89's67.0713: observed **+0.5946%**. Standard
+English/Japanese measured66.4126/73.3907 and held-out English/Japanese
+59.5179/72.4597 tok/s; all four were faster. All six prompt/output ID
+sequences and DSpark accepted/offered counts matched N89. This is one
+changed-candidate suite and does not establish statistical significance.
+
+The two-GPU oracle matched2296080 F32 pipeline values and1296 route IDs
+at NT1..8 with three changed captures. A further6480 F32 weights and6480
+IDs matched for both route geometries across ten cases: bias, ties at
+warp/bank boundaries, several winners in one lane, finite extremes,
+underflow, subnormals, signed zero and a nonzero sum below the clamp.
+The primary complete HCpre/RMS/N65 router/route gate used26 cold matrices,
+204472320 bytes, greater than twice L2100663296 bytes. Every captured
+matrix pointer, warp selector and bank's outputs were checked. Both paths
+use three kernels. Fixed NT3 measured1.13469x,16/16 balanced pairs faster;
+this is a component result, not the model's speed ratio.
+Actual-model batch8/rollback CHECK had max_abs=0 and relative_rms=0. All
+inference disk reads and major faults were zero, READY's three processes
+had zero swap, and409.518GiB residency passed nine times. Cache slots
+stayed1225/846. Original Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math,
+lookahead2 and262144/F16KV remain.70tok/s is unmet; server stopped,
+no new API checkpoint. Changes remain local; no push.
