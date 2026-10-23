@@ -69,6 +69,12 @@ void mxfp4_gu(const void* gate,const void* up,const float* x,const int32_t* ids,
               int n_in,int n_ff,int top_k,int tokens,float limit,void* stream,bool alu=false);
 void mxfp4_down(const void* down,const float* hidden,const int32_t* ids,float* out,
                 int n_ff,int n_out,int top_k,int tokens,void* stream,bool alu=false);
+// Four-block operand preload, original MXFP4 decode and per-lane FMA order.
+
+void mxfp4_pipe_gu(const void* gate,const void* up,const float* x,const int32_t* ids,float* hidden,
+              int n_in,int n_ff,int top_k,int tokens,float limit,void* stream,bool alu=false);
+void mxfp4_pipe_down(const void* down,const float* hidden,const int32_t* ids,float* out,
+                int n_ff,int n_out,int top_k,int tokens,void* stream,bool alu=false);
 
 struct Rope {
     int dim = 64, original_context = 0;

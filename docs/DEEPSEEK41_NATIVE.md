@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N65 settings. From the checkout root, copy it to an ignored local file:
+N69 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -293,3 +293,29 @@ host `cudaMemcpy` can return before final DMA completion. The existing
 FFNpost and HCpre/RMS tests also use this ordering, with correctness-only
 CTest runs. No production upload policy changed. No new N65API checkpoint;
 server remains stopped and70tok/s remains unmet.
+
+
+N69 adds `STRATA_DS41_MXFP4_PIPE4=1` to the adopted settings. It affects
+only DSpark's original MXFP4 routed GU and Down kernels: preload four
+successive 32-element blocks, then retain the original per-lane FMA and
+warp reduction order. Original packed weights, integer ALU decode,
+routes and clamps remain in use; no extra weight copy is allocated.
+The default is off. The original main Q4_K_M kernels and CPU F16C code
+are unchanged. The option requires 128-aligned input widths, checked
+before draft graph capture (the model uses 5120 and 2304).
+
+Two GPUs passed 4,810,752 full GU/Down bitwise comparisons at NT1..8
+with changing inputs/routes and graph replay. The original decoder's
+exhaustive exponent/nibble proof is reused. A complete GU+Down local
+fixture measured 1.15148x across 16 balanced pairs; this is an operator
+result, not a whole-model gain. The fixed four long requests measured
+**62.3569 tok/s**, 4092 timed tokens / 65.6223 s, versus N65's 61.7552:
+observed **+0.9742%**. All six generated ID sequences and draft counts
+match N65. Long-case speeds were 62.5031 / 66.5461 tok/s (standard EN/JA)
+and 55.9558 / 65.5769 (held-out EN/JA). Actual batch8/rollback CHECK
+has max_abs=0 and relative_rms=0. Model reads and major faults were zero
+for every case; all three processes had zero swap at READY. The original
+409.518 GiB model residency checks passed. This single run does not
+establish statistical significance. No new API checkpoint was run;
+the server is stopped and the 70 tok/s goal remains unmet. Changes are
+local; no push was performed.

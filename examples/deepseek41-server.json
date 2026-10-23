@@ -63,7 +63,8 @@
     "STRATA_DS41_REGISTER_64M": "1",
     "STRATA_DS41_FFN_POST_FUSE": "1",
     "STRATA_DS41_HC_PRE_NORM": "1",
-    "STRATA_DS41_ROUTER_PIPE4": "1"
+    "STRATA_DS41_ROUTER_PIPE4": "1",
+    "STRATA_DS41_MXFP4_PIPE4": "1"
   },
   "sampling": {
     "temperature": 0,
