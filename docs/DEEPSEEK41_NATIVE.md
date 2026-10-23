@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N71 settings. From the checkout root, copy it to an ignored local file:
+N75 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -342,3 +342,34 @@ Markov-head fixture measured2.22529x (16/16 balanced pairs faster), which
 is not a whole-model gain. The small observed long4 difference may be
 noise; no statistical claim. No new API checkpoint was run; server stopped,
 70tok/s unmet, local changes only and no push.
+
+
+N75 adds `STRATA_DS41_INDEX_RANK_BATCH=1`. Within the existing captured
+attention body, up to eight token columns with at most 512 score rows use
+one block per column in one kernel. CUB block radix ranking keeps the
+original descending float score order and stable index ties, including
+signed zero and NaN bit ordering. Larger row counts retain the original
+per-column CUB device sort. Index projections, scoring, attention sums,
+weights, scratch allocations and the graph shape keys are unchanged.
+The option defaults off; the adopted example enables it.
+
+On the same two RTX5090 GPUs and 24 CPU math participants, the fixed long4
+aggregate was **62.8825 tok/s**, 4092 timed tokens / 65.0738 seconds, versus
+N71's 62.5436: an observed **+0.5418%**. Standard English/Japanese measured
+62.6907/67.4709 and held-out English/Japanese 56.1068/66.5998 tok/s. All four
+were faster; all six generated ID sequences and DSpark counts matched N71.
+This is one changed-candidate suite and does not establish significance.
+
+The independent CUB ordering oracle matched 677376 IDs on both GPUs,
+covering arbitrary float bits, NaNs, infinities, signed zeros, ties, token
+counts 1..8 and row boundaries through 1024. The complete score/rank/
+attention fixture matched 19660800 attention values bitwise plus 615796
+ordered IDs, including paired checks. Its fixed NT3/ratio2/bucket512 local
+gate was 1.50320x, 16/16 pairs faster, including scoring and attention and
+excluding unchanged index-query projections. This is not a model gain.
+Actual-model batch8/rollback CHECK had max_abs=0 and relative_rms=0;
+all inference disk-read and major-fault deltas were zero, READY's three
+processes had zero swap, and 409.518 GiB residency passed nine times.
+Original Q4_K_M, CPU F16C math, DSpark MXFP4, TP2/all40, lookahead2 and
+262144/F16 KV remain. No new API checkpoint; server stopped. The 70 tok/s
+goal is unmet. Changes and commits remain local; no push.
