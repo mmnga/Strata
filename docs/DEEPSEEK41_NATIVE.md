@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N49 settings. From the checkout root, copy it to an ignored local file:
+N55 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -112,6 +112,17 @@ stop every pause. The 20 ms condition-variable deadline, participants,
 affinity, task/completion protocol and arithmetic remain unchanged.
 `STRATA_DS41_POOL_CLOCK=1` enables it and requires MWAITX disabled;
 the default preserves the previous clock loop.
+N55 omits the router and shared FFN projection copies on each layer's
+non-owner rank with `STRATA_DS41_OWNER_WEIGHTS=1`. HC and its norms stay
+mirrored. The original serial CHECK temporarily loads its oracle copies
+and frees them before timing. This saved 558.691 MiB per GPU on the tested
+model; cache capacity increased from 1193/814 to 1225/846 slots.
+`STRATA_DS41_REGISTER_64M=1` uses 64 MiB host registration regions and the
+same boundaries for GPU transfers. It avoids a large per-registration
+kernel allocation that failed on the tested fragmented host. Every model
+byte remains pinned and residency checks remain mandatory. Without this
+flag the previous 1 GiB region size remains in use. Both region sizes
+passed cross-boundary byte-copy tests on both GPUs.
 Unadopted diagnostic paths remain disabled in the example.
 
 ## Validation and measured performance
@@ -197,3 +208,21 @@ Enable the source-only push check once with
 Run `python3 tools/deepseek41/check_push.py` before
 `git push --set-upstream origin deepseek`. The check also runs as a pre-push
 hook and inspects every outgoing commit, including files later deleted.
+
+
+2026-10-23, N55 on the same hardware and model settings: four long cases
+measured 61.8837/65.4314 tok/s (standard EN/JA) and 55.4000/64.4661 tok/s
+(held-out EN/JA). Aggregate: 4092 timed tokens / 66.5002 seconds =
+**61.5336 tok/s**, an observed 1.313% over N49. All six generated sequences
+and some draft acceptance counts changed, with identical prompt IDs;
+held-out English was slower. This is a fixed-prompt throughput observation,
+not an isolated same-output speedup or a significance claim. No arithmetic
+or precision option was changed; larger caches can change CPU/GPU expert
+assignment. Original batch8 and rollback CHECK passed at max_abs 0 and
+relative_rms 0; that CHECK bypasses the expert cache, so it does not prove
+cached-versus-CPU logit identity. Each case had zero model disk reads and
+major faults; main plus two RAM lockers had zero swap at READY, and all
+409.518 GiB remained resident. The first N55 startup failed during CUDA
+host registration before READY; the 64 MiB option above allowed the full
+run to complete. N55 is adopted locally; N49 is retained. No new API
+checkpoint was run for N55; the 70 tok/s goal remains unmet.

@@ -2,12 +2,15 @@
 #include <cuda_runtime.h>
 #include <sys/mman.h>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 
 void ck(cudaError_t e) { if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e)); }
 int main() {
-    constexpr size_t chunk = 1ull<<30, tail = 2ull<<20;
+    const char* small = std::getenv("STRATA_DS41_REGISTER_64M");
+    const size_t chunk = small && std::strcmp(small,"1") == 0 ? 64ull<<20 : 1ull<<30;
+    constexpr size_t tail = 2ull<<20;
     uint8_t* src = static_cast<uint8_t*>(mmap(nullptr,chunk+tail,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
     if (src == MAP_FAILED) return 1;
     try {

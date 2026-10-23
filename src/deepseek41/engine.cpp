@@ -177,6 +177,16 @@ bool owner_ffn_weight(const std::string& name) {
     return sub.rfind("ffn_",0)==0 || sub.rfind("hc_ffn_",0)==0 || sub=="exp_probs_b.bias";
 }
 
+// Shared/routing projections are consumed only by the FFN owner even when
+// HC and its normalizations remain mirrored on both attention ranks.
+bool owner_ffn_projection(const std::string& name) {
+    if(name.rfind("blk.",0)!=0) return false;
+    const auto dot=name.find('.',4); if(dot==std::string::npos) return false;
+    const auto sub=name.substr(dot+1);
+    return sub=="ffn_gate_inp.weight" || sub=="ffn_gate_shexp.weight" ||
+           sub=="ffn_up_shexp.weight" || sub=="ffn_down_shexp.weight";
+}
+
 class Engine {
 public:
     Model model;
@@ -215,6 +225,7 @@ public:
     bool speculative = false;
     bool attention_replay = [] { const char* v = std::getenv("STRATA_DS41_ATTENTION_GRAPH"); return v && std::atoi(v) != 0; }();
     bool hc_owner = [] { const char* v=std::getenv("STRATA_DS41_HC_OWNER"); return v && std::atoi(v)!=0; }();
+    bool owner_weights = [] { const char* v=std::getenv("STRATA_DS41_OWNER_WEIGHTS"); return v && std::atoi(v)!=0; }();
     std::vector<std::vector<int32_t>> window_routes;
     strata::kernels::cpu::ThreadAffinity affinity;
     Engine(const std::string& path,int ctx,int threads,int gpu_count,int cache_mib,int depth) : model(path),c(model.config()),cpu(threads),
@@ -244,17 +255,26 @@ public:
         for (int r = 0; r < gpu_count; ++r) ranks.push_back(std::make_unique<Rank>(r,r,gpu_count));
         for (auto& rp : ranks) {
             auto& r = *rp; ck(cudaSetDevice(r.id));
+            size_t omitted_bytes=0; int omitted=0;
             for (size_t s = 0; s < model.gguf().size(); ++s) for (const auto& t : model.gguf().shard(s).tensors()) {
                 if (t.name.find("_exps.weight") != std::string::npos || t.name.find("engram_embd.weight") != std::string::npos) continue;
                 // Output and embedding are shared from rank zero; every layer
                 // mirrors HC/KV and splits heads/output groups across ranks.
                 if (r.rank && t.name.rfind("blk.",0) != 0) continue;
-                if(hc_owner && owner_ffn_weight(t.name)) {
+                if((hc_owner && owner_ffn_weight(t.name)) || (owner_weights && owner_ffn_projection(t.name))) {
                     const int layer=std::stoi(t.name.substr(4));
-                    if(size_t(layer)*ranks.size()/size_t(c.layers)!=size_t(r.rank)) continue;
+                    if(size_t(layer)*ranks.size()/size_t(c.layers)!=size_t(r.rank)) {
+                        if(owner_weights && owner_ffn_projection(t.name)) {
+                            const auto ref=model.tensor(t.name); size_t bytes=ref.bytes();
+                            if(t.type==30 || t.type==1) { size_t elements=1;for(auto d:t.shape)elements*=d;bytes=elements*4; }
+                            omitted_bytes+=bytes; ++omitted;
+                        }
+                        continue;
+                    }
                 }
                 r.load(t.name,model.tensor(t.name),c);
             }
+            if(owner_weights) std::fprintf(stderr,"strata-deepseek41: rank=%d owner-only FFN projections omitted=%d GPU_MiB=%.6f\n",r.id,omitted,double(omitted_bytes)/(1<<20));
             allocate(r);
             if(grouped_oa) for(int l=0;l<c.layers;++l) {
                 const auto& w=r.w(block(l)+"attn_output_a.weight");

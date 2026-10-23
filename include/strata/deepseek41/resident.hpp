@@ -4,7 +4,8 @@
 
 namespace strata::deepseek41 {
 
-// Owned tensors are registered in 1 GiB regions. CUDA host copies must not
+// Owned tensors use matching 1 GiB (or opt-in 64 MiB) registrations and copy
+// boundaries. CUDA host copies must not
 // straddle two independent registrations, even when both ranges are pinned.
 void copy_registered_slice(void* destination,const uint8_t* base,size_t offset,size_t bytes,void* stream);
 

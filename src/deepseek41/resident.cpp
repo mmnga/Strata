@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
 #include <cstdio>
 #include <map>
 #include <fstream>
@@ -20,7 +21,17 @@
 extern char** environ;
 namespace strata::deepseek41 {
 namespace {
-constexpr size_t huge = 2ull<<20, chunk = 1ull<<30;
+constexpr size_t huge = 2ull<<20;
+// Linux long-term pinning can allocate a page-pointer array proportional to
+// the registration size. Use smaller regions on fragmented hosts, while the
+// transfer helper below honors exactly the same registration boundaries.
+size_t registration_chunk() {
+    static const size_t bytes = [] {
+        const char* value = std::getenv("STRATA_DS41_REGISTER_64M");
+        return value && std::strcmp(value,"1") == 0 ? 64ull<<20 : 1ull<<30;
+    }();
+    return bytes;
+}
 void ck(cudaError_t e) { if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e)); }
 }
 struct ResidentWeights::Impl {
@@ -61,8 +72,14 @@ struct ResidentWeights::Impl {
         });
         for (auto& t : copy) t.join();
         if (!equal) throw std::runtime_error("resident raw-byte verification failed: "+name);
+        const size_t chunk = registration_chunk();
         for (size_t off = 0; off < r.allocated; off += chunk) {
-            ck(cudaHostRegister(r.address+off,std::min(chunk,r.allocated-off),cudaHostRegisterPortable));
+            const size_t bytes = std::min(chunk,r.allocated-off);
+            const auto status = cudaHostRegister(r.address+off,bytes,cudaHostRegisterPortable);
+            if (status != cudaSuccess)
+                throw std::runtime_error("CUDA host registration failed: "+name+
+                    " offset="+std::to_string(off)+" bytes="+std::to_string(bytes)+
+                    ": "+cudaGetErrorString(status));
             r.registered.push_back(off);
         }
         // Release only this tensor's original file pages, after exact copying
@@ -103,6 +120,7 @@ ResidentWeights::ResidentWeights() : p_(std::make_unique<Impl>()) {}
 void copy_registered_slice(void* destination,const uint8_t* base,size_t offset,size_t bytes,void* stream) {
     if (!stream || offset > SIZE_MAX-bytes) throw std::invalid_argument("invalid registered model transfer");
     auto* dst = static_cast<uint8_t*>(destination);
+    const size_t chunk = registration_chunk();
     while (bytes) {
         const size_t n = std::min(bytes,chunk-offset%chunk);
         ck(cudaMemcpyAsync(dst,base+offset,n,cudaMemcpyHostToDevice,static_cast<cudaStream_t>(stream)));
@@ -122,6 +140,7 @@ void ResidentWeights::load(const Model& m) {
     if (!available || available < m.routed_bytes()+m.engram_bytes()+(8ull<<30))
         throw std::runtime_error("not enough available RAM for the entire model plus 8 GiB reserve");
     ck(cudaSetDevice(0));
+    std::fprintf(stderr,"strata-deepseek41: host registration region=%zu MiB\n",registration_chunk()>>20);
     for (int l = 0; l < m.config().layers; ++l) {
         const std::string prefix = "blk."+std::to_string(l)+".";
         for (const char* matrix : {"ffn_gate_exps.weight","ffn_up_exps.weight","ffn_down_exps.weight"}) p_->own(prefix+matrix,m.tensor(prefix+matrix));
@@ -134,7 +153,7 @@ void ResidentWeights::load(const Model& m) {
     verify();
 }
 void ResidentWeights::verify() const {
-    const size_t page = size_t(sysconf(_SC_PAGESIZE)); std::vector<unsigned char> resident(chunk/page);
+    const size_t page = size_t(sysconf(_SC_PAGESIZE)), chunk = registration_chunk(); std::vector<unsigned char> resident(chunk/page);
     uint64_t pages = 0;
     for (const auto& item : p_->ranges) {
         const auto& r = item.second;
