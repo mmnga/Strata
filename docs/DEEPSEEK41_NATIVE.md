@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N80 settings. From the checkout root, copy it to an ignored local file:
+N83 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -481,3 +481,34 @@ zero swap, and409.518GiB residency passed nine times. Cache slots stayed
 1225/846 with1536MiB reserve per GPU. Original Q4_K_M, DSpark MXFP4,
 TP2/all40,24math, lookahead2 and262144/F16KV remain. Server stopped;
 no new API checkpoint;70tok/s remains unmet. No push.
+
+
+N83 adds `STRATA_DS41_DSPARK_GROUPED_OA=1`. The original DSpark Q8_0
+output-A has eight4096x1024 groups. Quantize the complete32768-wide input
+once and use the existing exact grouped Qwen MMVQ body with Q8_0 traits.
+This removes per-group gather/scatter and repeated quantization. Original
+Q8_0 weights, dot products, reductions and output-B stay the same. The
+ordinary Q8_0 dispatcher is unchanged. The option defaults off and guards
+the original draft geometry; the example enables it. Pre-capture plain
+quant storage grows by110592 bytes on the draft GPU, with no IL allocation.
+
+The fixed four-long aggregate measured **64.5827 tok/s**,4092 timed tokens /
+63.3606 seconds, versus N80's64.2089: observed **+0.5822%**. Standard
+English/Japanese measured63.8808/69.8284 and held-out English/Japanese
+57.3241/68.8875 tok/s. All four were faster. All six prompt/output ID
+sequences and DSpark accepted/offered counts matched N80. A single changed
+candidate suite does not establish statistical significance.
+
+The two-GPU output-path oracle matched9953280 F32 values bit for bit
+at NT1..8 across three changed captured inputs, including zero, signed
+zero and subnormals. The fixed NT5 full inverse-RoPE/output-A/output-B
+gate used three cold weight banks,240648192 bytes, greater than twice
+reported L2100663296 bytes. All weight pointers and each bank's outputs
+were checked. The ratio was1.46646x,16/16 balanced pairs faster, with
+35->5 kernels; common input reset/submission/synchronization were included.
+This is a component result. Actual-model batch8/rollback CHECK had max_abs=0
+and relative_rms=0. All inference disk reads and major faults were zero,
+READY's three processes had zero swap, and409.518GiB residency passed nine
+times. Cache slots remained1225/846. Original main Q4_K_M/F16C, DSpark
+MXFP4, TP2/all40,24math, lookahead2 and262144/F16KV remain. CUDA was tested.
+Server stopped; no new API checkpoint.70tok/s remains unmet. No push.

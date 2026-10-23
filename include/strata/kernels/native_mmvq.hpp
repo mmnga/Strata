@@ -31,7 +31,7 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 // graph capture; captured graphs keep the kernels they captured.
 void native_mmvq_set_multi_exact(bool exact);
 bool native_mmvq_multi_exact();
-// Native DeepSeek grouped output projection. Unchanged raw Q4_K/Q6_K matrices
+// Native DeepSeek grouped output projection. Unchanged raw Q8_0/Q4_K/Q6_K matrices
 // [groups][n_out][n_in], x/y token-major with all groups contiguous per token.
 // x_q8_1 and optional x_il quantize the complete groups*n_in input. Reuses
 // the ordinary exact selector (interleaved at 2..4 columns, plain at 1/5..8).

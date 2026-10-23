@@ -3207,7 +3207,7 @@ void grouped_il_columns(int r,const void* w,const void* x,float* y,int ni,int no
 } // namespace
 void native_mmvq_grouped(int type,const void* weights,const void* x_q8_1,const void* x_il,float* y,
                          int ni,int no,int groups,int nc,void* stream) {
-    if((type!=12 && type!=14) || !g_multi_exact || groups<1 || groups>64 || no<1 ||
+    if((type!=8 && type!=12 && type!=14) || !g_multi_exact || groups<1 || groups>64 || no<1 ||
        int64_t(groups)*std::max(ni,no)>INT32_MAX) throw std::invalid_argument("grouped MMVQ layout");
     validate_shape(ni,nc,QK);validate_pointer(weights);validate_pointer(x_q8_1);validate_pointer(y);validate_stream(stream);
     const auto s=static_cast<cudaStream_t>(stream);
@@ -3223,7 +3223,8 @@ void native_mmvq_grouped(int type,const void* weights,const void* x_q8_1,const v
         if(type==12) grouped_il_columns<IlQ4K>(rows,weights,x_il,y,ni,no,groups,nc,s);
         else grouped_il_columns<IlQ6K>(rows,weights,x_il,y,ni,no,groups,nc,s);
     } else {
-        if(type==12) grouped_plain_columns<Q4KTraits>(weights,x_q8_1,y,ni,no,groups,nc,s);
+        if(type==8) grouped_plain_columns<SmallTraits<Q80Block,8>>(weights,x_q8_1,y,ni,no,groups,nc,s);
+        else if(type==12) grouped_plain_columns<Q4KTraits>(weights,x_q8_1,y,ni,no,groups,nc,s);
         else grouped_plain_columns<Q6KTraits>(weights,x_q8_1,y,ni,no,groups,nc,s);
     }
     launch_check();

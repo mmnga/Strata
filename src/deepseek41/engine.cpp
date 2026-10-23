@@ -1,5 +1,6 @@
 #include "strata/deepseek41/engine.hpp"
 #include "strata/deepseek41/dspark_head.hpp"
+#include "strata/deepseek41/draft_output.hpp"
 #include "strata/deepseek41/index_rank.hpp"
 #include "strata/deepseek41/attention_async.hpp"
 #include "strata/deepseek41/norm_quant.hpp"
@@ -1074,6 +1075,7 @@ public:
     bool mxfp4_alu = [] { const char* v=std::getenv("STRATA_DS41_MXFP4_ALU"); return v && std::atoi(v)!=0; }();
     bool mxfp4_pipe = [] { const char* v=std::getenv("STRATA_DS41_MXFP4_PIPE4"); return v && std::atoi(v)!=0; }();
     float min_confidence = [] { const char* v=std::getenv("STRATA_DS41_DSPARK_P_MIN"); return v ? std::stof(v) : 0.0f; }();
+    bool grouped_output=[] {const char* v=std::getenv("STRATA_DS41_DSPARK_GROUPED_OA");return v && std::atoi(v)!=0;}();
     bool conditional_head=[] {const char* v=std::getenv("STRATA_DS41_DSPARK_CONDITIONAL_HEAD");return v && std::atoi(v)!=0;}();
     std::vector<std::unique_ptr<DraftCaptureStream>> head_streams;
     Host<int32_t> proposals{Batch};
@@ -1126,6 +1128,14 @@ public:
                 throw std::runtime_error("conditional DSpark head requires original BF16-expanded F32 Markov matrices");
             for(int t=0;t<5;++t)head_streams.push_back(std::make_unique<DraftCaptureStream>(rank.id));
         }
+        if(grouped_output){
+            if(c.head_dim!=512 || c.heads!=64 || c.o_groups!=8 || c.o_rank!=1024)
+                throw std::runtime_error("grouped draft output requires original eight-group geometry");
+            for(int l=0;l<3;++l){const auto& a=rank.w(block(l)+"attn_output_a.weight");
+                if(a.type!=8 || a.in!=4096 || a.out!=8192)
+                    throw std::runtime_error("grouped draft output requires original Q8_0 output-A");}
+        }
+        std::fprintf(stderr,"strata-deepseek41: original Q8_0 DSpark grouped output-A=%d\n",grouped_output ? 1 : 0);
         std::fprintf(stderr,"strata-deepseek41: original DSpark conditional Markov prefix=%d\n",conditional_head ? 1 : 0);
         allocate();
         if (replay) {
@@ -1153,6 +1163,8 @@ public:
         // decoding can use wide IL before any legacy IL allocation exists.
         // Allocate outside capture; the same bounded reserve covers it.
         if(r.wide_il) r.buffer("q8_il",K::native_q8_1_il_bytes(H*4,Batch));
+        if(grouped_output) r.buffers["q8"]=std::make_unique<Buffer>(r.id,K::native_q8_1_bytes(A*D,Batch));
+
         r.raw.resize(3); for (auto& raw : r.raw) raw = std::make_unique<Buffer>(r.id,size_t(c.sliding_window+Batch)*D*2);
     }
     C::Rope rope_config() const { C::Rope rc; rc.dim = c.rope_dim; rc.base = float(c.rope_base); return rc; }
@@ -1198,7 +1210,9 @@ public:
         C::rope(r.f("attn",A*D),D,A,n,r.buffer("position",4).i(),rope_config(),true,r.stream);
         const int width = A/c.o_groups*D; const auto& matrix = r.w(p+"attn_output_a.weight");
         const size_t group_bytes = K::native_mmvq_weight_bytes(matrix.type,width,c.o_rank);
-        for (int g = 0; g < c.o_groups; ++g) {
+        if(grouped_output) strata::deepseek41::draft_output_a(matrix.storage->p,r.f("attn",A*D),
+            r.buffers.at("q8")->p,r.f("oa",c.o_rank*c.o_groups),n,r.stream);
+        else for (int g = 0; g < c.o_groups; ++g) {
             C::strided_copy(r.f("attn",A*D)+size_t(g)*width,r.f("group_in",width),width,n,A*D,width,r.stream);
             void* q = r.buffer("q8",K::native_q8_1_bytes(width,n)).p; K::native_quantize_q8_1(r.f("group_in",width),q,width,n,r.stream);
             K::native_mmvq(matrix.type,static_cast<const uint8_t*>(matrix.storage->p)+size_t(g)*group_bytes,q,r.f("group_out",c.o_rank),width,c.o_rank,n,r.stream);
