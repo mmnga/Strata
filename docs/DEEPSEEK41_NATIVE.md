@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N83 settings. From the checkout root, copy it to an ignored local file:
+N86 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -512,3 +512,36 @@ READY's three processes had zero swap, and409.518GiB residency passed nine
 times. Cache slots remained1225/846. Original main Q4_K_M/F16C, DSpark
 MXFP4, TP2/all40,24math, lookahead2 and262144/F16KV remain. CUDA was tested.
 Server stopped; no new API checkpoint.70tok/s remains unmet. No push.
+
+
+N86 adds `STRATA_DS41_HC_COEFF_WARP=1`. The original HC coefficient
+kernel uses one thread for its4x4 matrix. Sixteen warp lanes now compute
+its independent entries. Row and column sums still add all four terms
+in their original order, starting from the same zero or epsilon. The
+original FMA, exponential, division, pre/post coefficients and twenty
+Sinkhorn iterations remain. This applies to target and draft coefficients;
+other math files and CPU F16C are unchanged. No new buffers or kernels are
+added to the path. The option defaults off, requires four HC streams and
+twenty iterations, and is enabled in the example. Serial CHECK disables
+it throughout the original reference prefix.
+
+The fixed four-long aggregate measured **65.3111 tok/s**,4092 timed tokens /
+62.6540 seconds, versus N83's64.5827: observed **+1.1278%**. Standard
+English/Japanese measured64.4065/70.8022 and held-out English/Japanese
+57.8348/69.9081 tok/s. All four were faster. All six prompt/output ID
+sequences and DSpark accepted/offered counts matched N83. The70tok/s
+goal uses the four-long aggregate; it remains unmet. A single changed
+candidate suite does not establish statistical significance.
+
+The two-GPU oracle matched4447872 F32 values at NT1..8, with changed
+full-HC captures and separate coefficient cases for zeros, saturation and
+subnormals. The complete flat-RMS/Q8_1/Q4_K20480x24/HC coefficient gate
+used729 cold matrices,201553920 bytes, greater than twice reported
+L2100663296 bytes. Every captured weight pointer and each bank's outputs
+were checked. At fixed NT3 both paths use four kernels; the ratio was
+1.10017x,16/16 balanced pairs faster. This is a component result. Actual
+batch8/rollback CHECK had max_abs=0 and relative_rms=0. All inference disk
+reads and major faults were zero, READY's three processes had zero swap,
+and409.518GiB residency passed nine times. Cache slots remained1225/846.
+Original main Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math, lookahead2 and
+262144/F16KV remain. Server stopped; no new API checkpoint. No push.

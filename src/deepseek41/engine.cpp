@@ -1,6 +1,7 @@
 #include "strata/deepseek41/engine.hpp"
 #include "strata/deepseek41/dspark_head.hpp"
 #include "strata/deepseek41/draft_output.hpp"
+#include "strata/deepseek41/hc_coeff.hpp"
 #include "strata/deepseek41/index_rank.hpp"
 #include "strata/deepseek41/attention_async.hpp"
 #include "strata/deepseek41/norm_quant.hpp"
@@ -221,6 +222,7 @@ public:
     bool parallel_values = [] { const char* v=std::getenv("STRATA_DS41_ATTENTION_VALUES"); return v && std::atoi(v)!=0; }();
     bool prefetch_values = [] { const char* v=std::getenv("STRATA_DS41_VALUE_PREFETCH"); return v && std::atoi(v)!=0; }();
     bool prefetch_query = [] { const char* v=std::getenv("STRATA_DS41_QUERY_PREFETCH"); return v && std::atoi(v)!=0; }();
+    bool hc_coeff_warp=[] {const char* v=std::getenv("STRATA_DS41_HC_COEFF_WARP");return v && std::atoi(v)!=0;}();
     bool norm_q8_first=[] {const char* v=std::getenv("STRATA_DS41_NORM_Q8_FIRST");return v&&std::atoi(v)!=0;}();
     bool query_reuse=[] {const char* v=std::getenv("STRATA_DS41_QUERY_REUSE");return v&&std::atoi(v)!=0;}();
     std::vector<int> query_capacity;
@@ -349,6 +351,9 @@ public:
             }
         }
         std::fprintf(stderr,"strata-deepseek41: original first attention HC/norm/Q81 producer=%d; FFN/draft unchanged\n",norm_q8_first ? 1 : 0);
+        if(hc_coeff_warp && (c.hc!=4 || c.sinkhorn_iterations!=20))
+            throw std::runtime_error("warp HC coefficients require original four-stream/twenty-iteration model");
+        std::fprintf(stderr,"strata-deepseek41: original ordered warp HC coefficients=%d\n",hc_coeff_warp ? 1 : 0);
         resident.load(model);
         enable_cache(cache_mib,depth);
         std::fprintf(stderr,"strata-deepseek41: native Strata driver, TP=%d all %d layers, CPU math threads=%d, context=%d F16 KV\n",gpu_count,c.layers,cpu.threads(),context);
@@ -443,7 +448,7 @@ public:
         const auto prefix = block(layer)+"hc_"+suffix;
         C::rms(r.f("residual",c.hidden*4),nullptr,r.f("flat_norm",c.hidden*4),c.hidden*4,tokens,float(c.rms_eps),r.stream);
         r.mat(prefix+"_fn.weight",r.f("flat_norm",c.hidden*4),r.f("mix",24),tokens);
-        C::hc_coeff(r.f("mix",24),r.weight(prefix+"_scale.weight"),r.weight(prefix+"_base.weight"),pre,r.f("post",4),r.f("comb",16),tokens,float(c.hc_eps),c.sinkhorn_iterations,r.stream);
+        (hc_coeff_warp ? C::hc_coeff_warp : C::hc_coeff)(r.f("mix",24),r.weight(prefix+"_scale.weight"),r.weight(prefix+"_base.weight"),pre,r.f("post",4),r.f("comb",16),tokens,float(c.hc_eps),c.sinkhorn_iterations,r.stream);
     }
     void pre_norm(Rank& r,const std::string& name,const float* pre,int tokens) {
         const int H=c.hidden;
@@ -1000,6 +1005,7 @@ public:
         const bool candidate_prefetch_values=prefetch_values; prefetch_values=false;
         const bool candidate_prefetch_query=prefetch_query; prefetch_query=false;
         const bool candidate_norm_q8_first=norm_q8_first; norm_q8_first=false;
+        const bool candidate_hc_coeff_warp=hc_coeff_warp; hc_coeff_warp=false;
         const bool candidate_query_reuse=query_reuse; query_reuse=false;
         const bool candidate_value_async=value_async; value_async=false;
         const bool candidate_index_rank_batch=index_rank_batch; index_rank_batch=false;
@@ -1034,6 +1040,7 @@ public:
         hc_pre_norm=candidate_hc_pre_norm;
         router_pipe=candidate_router_pipe;
         norm_q8_first=candidate_norm_q8_first;
+        hc_coeff_warp=candidate_hc_coeff_warp;
         query_reuse=candidate_query_reuse;
         value_async=candidate_value_async;
         index_rank_batch=candidate_index_rank_batch;
@@ -1075,6 +1082,7 @@ public:
     bool mxfp4_alu = [] { const char* v=std::getenv("STRATA_DS41_MXFP4_ALU"); return v && std::atoi(v)!=0; }();
     bool mxfp4_pipe = [] { const char* v=std::getenv("STRATA_DS41_MXFP4_PIPE4"); return v && std::atoi(v)!=0; }();
     float min_confidence = [] { const char* v=std::getenv("STRATA_DS41_DSPARK_P_MIN"); return v ? std::stof(v) : 0.0f; }();
+    bool hc_coeff_warp=[] {const char* v=std::getenv("STRATA_DS41_HC_COEFF_WARP");return v && std::atoi(v)!=0;}();
     bool grouped_output=[] {const char* v=std::getenv("STRATA_DS41_DSPARK_GROUPED_OA");return v && std::atoi(v)!=0;}();
     bool conditional_head=[] {const char* v=std::getenv("STRATA_DS41_DSPARK_CONDITIONAL_HEAD");return v && std::atoi(v)!=0;}();
     std::vector<std::unique_ptr<DraftCaptureStream>> head_streams;
@@ -1189,7 +1197,7 @@ public:
         auto& r = rank; const auto p = block(l)+"hc_"+sub;
         C::rms(r.f("residual",c.hidden*4),nullptr,r.f("flat_norm",c.hidden*4),c.hidden*4,n,float(c.rms_eps),r.stream);
         r.mat(p+"_fn.weight",r.f("flat_norm",c.hidden*4),r.f("mix",24),n);
-        C::hc_coeff(r.f("mix",24),r.weight(p+"_scale.weight"),r.weight(p+"_base.weight"),pre,r.f("post",4),r.f("comb",16),n,float(c.hc_eps),c.sinkhorn_iterations,r.stream);
+        (hc_coeff_warp ? C::hc_coeff_warp : C::hc_coeff)(r.f("mix",24),r.weight(p+"_scale.weight"),r.weight(p+"_base.weight"),pre,r.f("post",4),r.f("comb",16),n,float(c.hc_eps),c.sinkhorn_iterations,r.stream);
     }
     void attention(int l,int n) {
         auto& r = rank; const auto p = block(l); const int H = c.hidden, D = c.head_dim, A = c.heads;
