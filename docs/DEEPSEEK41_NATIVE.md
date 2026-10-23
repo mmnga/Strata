@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N88 settings. From the checkout root, copy it to an ignored local file:
+N89 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -581,6 +581,43 @@ was1.21240x,16/16 balanced pairs faster. This is a component result. Actual
 batch8/rollback CHECK had max_abs=0 and relative_rms=0. All inference disk
 reads and major faults were zero, READY's three processes had zero swap,
 and409.518GiB residency passed nine times. Cache slots remained1225/846.
+Original Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math, lookahead2 and
+262144/F16KV remain.70tok/s is still unmet; server stopped, no new API
+checkpoint. No push.
+
+
+N89 adds `STRATA_DS41_HC_ROW_TOKENS=1`, requiring N88's HC input
+producer. For the original target HC Q4_K20480x24 projections, each
+row/token pair gets one CTA running the existing exact Qwen MMVQ body
+with one row and one column. At three tokens this exposes72 independent
+CTAs instead of12. Each dot retains its weight blocks, FMA order and
+four-warp/warp reduction; this is not split-K. Ordinary multi-column
+specializations compile the new offset condition away. The CUDA-only
+adapter adds no buffers, weight copies or cache reservation.
+
+The HC producer emits plain Q8_1 for all token counts on this path, so it
+need not also write IL at NT5..8. Other projections retain their existing
+selectors. Default is off; the example enables it. Serial CHECK clears
+the flag throughout the original reference prefix.
+
+The fixed four-long aggregate measured **67.0713 tok/s**,4092 timed tokens /
+61.0097 seconds, versus N88's66.3757: observed **+1.0480%**. Standard
+English/Japanese measured65.9183/73.0610 and held-out English/Japanese
+59.0568/72.2141 tok/s. All four were faster. All six prompt/output ID
+sequences and DSpark accepted/offered counts matched N88. One changed
+candidate suite does not establish statistical significance.
+
+The two-GPU oracle matched4475320 F32 values and5022720 plain Q8_1
+bytes at NT1..8, with changed captures, zero blocks, a whole-zero input,
+signed zero, subnormals, null gamma and an observable inverse. The
+complete N88 HC preparation versus row/token path used729 cold matrices,
+201553920 bytes, greater than twice L2100663296 bytes. Each captured
+weight pointer and24-by-token128-thread grid, and every bank's outputs,
+were checked. Both paths use four kernels; fixed NT3 measured1.18649x,
+16/16 balanced pairs faster. This is a component result. Actual-model
+batch8/rollback CHECK had max_abs=0 and relative_rms=0. All inference disk
+reads and major faults were zero, READY's three processes had zero swap,
+and409.518GiB residency passed nine times. Cache slots stayed1225/846.
 Original Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math, lookahead2 and
 262144/F16KV remain.70tok/s is still unmet; server stopped, no new API
 checkpoint. No push.

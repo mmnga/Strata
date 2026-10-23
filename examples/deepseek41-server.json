@@ -72,7 +72,8 @@
     "STRATA_DS41_NORM_Q8_FIRST": "1",
     "STRATA_DS41_DSPARK_GROUPED_OA": "1",
     "STRATA_DS41_HC_COEFF_WARP": "1",
-    "STRATA_DS41_HC_NORM_Q8": "1"
+    "STRATA_DS41_HC_NORM_Q8": "1",
+    "STRATA_DS41_HC_ROW_TOKENS": "1"
   },
   "sampling": {
     "temperature": 0,

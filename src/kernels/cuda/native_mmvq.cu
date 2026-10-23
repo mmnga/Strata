@@ -1171,6 +1171,15 @@ __launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
 __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w, const Q81Block* x_, float* y_,
                                          int n_in, int n_out,
                                          const typename F::Block* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr) {
+#if !defined(__HIPCC__)
+    // The fixed DeepSeek HC adapter launches one independent row/token per
+    // CTA with NCOLS=ROWS=1. Ordinary multi-column specializations retain
+    // their existing code; weights and each dot/reduction stay unchanged.
+    if constexpr (NCOLS==1 && ROWS==1 && !GROUPED && !PAIR) {
+        x_+=std::size_t(blockIdx.y)*(n_in/Q8K);
+        y_+=std::size_t(blockIdx.y)*n_out;
+    }
+#endif
     if constexpr (GROUPED) {
         w+=std::size_t(blockIdx.y)*n_out*(n_in/F::DIV);
         x_+=std::size_t(blockIdx.y)*(n_in/Q8K);
@@ -3205,6 +3214,15 @@ void grouped_il_columns(int r,const void* w,const void* x,float* y,int ni,int no
     }
 }
 } // namespace
+void native_hc_q4_k_row_tokens(const void* weights,const void* plain,float* output,int tokens,void* stream) {
+    if(!g_multi_exact)throw std::invalid_argument("HC row/token adapter requires exact columns");
+    validate_shape(20480,tokens,QK);validate_pointer(weights);validate_pointer(plain);validate_pointer(output);validate_stream(stream);
+    launch_pdl(native_mmvq_multi_kernel<Q4KTraits,1,WARPS,1,false,false,false>,
+        dim3(24,tokens),dim3(WARP,WARPS),0,static_cast<cudaStream_t>(stream),
+        static_cast<const Q4KTraits::Block*>(weights),static_cast<const Q81Block*>(plain),output,20480,24,
+        (const Q4KTraits::Block*)nullptr,(float*)nullptr);
+    launch_check();
+}
 void native_mmvq_grouped(int type,const void* weights,const void* x_q8_1,const void* x_il,float* y,
                          int ni,int no,int groups,int nc,void* stream) {
     if((type!=8 && type!=12 && type!=14) || !g_multi_exact || groups<1 || groups>64 || no<1 ||
@@ -3231,6 +3249,10 @@ void native_mmvq_grouped(int type,const void* weights,const void* x_q8_1,const v
 }
 
 #else  // HIP: no interleaved path
+void native_hc_q4_k_row_tokens(const void*,const void*,float*,int,void*) {
+    throw std::invalid_argument("native HC row/token projection is CUDA only");
+}
+
 void native_mmvq_grouped(int,const void*,const void*,const void*,float*,int,int,int,int,void*) {
     throw std::invalid_argument("native grouped projection is CUDA only");
 }

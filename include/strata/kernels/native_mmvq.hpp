@@ -38,6 +38,10 @@ bool native_mmvq_multi_exact();
 // CUDA only; no allocation or weight repacking, explicit stream.
 void native_mmvq_grouped(int type,const void* weights,const void* x_q8_1,const void* x_il,
                          float* y,int n_in,int n_out,int groups,int ncols,void* stream);
+// Original DeepSeek HC Q4_K [20480,24]. One unchanged exact dot per
+// row/token CTA, plain Q8_1 for all1..8 tokens. CUDA only, no split-K.
+void native_hc_q4_k_row_tokens(const void* weights,const void* x_q8_1,float* y,
+                              int tokens,void* stream);
 // B6 (lab, opt-in STRATA_B6_MMVQ_ROWS=1): the exact multi-column layout with the activation blocks of every column
 // loaded once per weight block and reused across the block's rows (bitwise the same sums as the default exact
 // layout). 0 = off (default), 1 = 2 rows per block, 2 / 4 / 8 = that many rows. Q4_K, Q5_K, Q6_K and IQ4_XS only.

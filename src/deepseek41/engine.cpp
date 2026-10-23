@@ -223,6 +223,7 @@ public:
     bool prefetch_values = [] { const char* v=std::getenv("STRATA_DS41_VALUE_PREFETCH"); return v && std::atoi(v)!=0; }();
     bool prefetch_query = [] { const char* v=std::getenv("STRATA_DS41_QUERY_PREFETCH"); return v && std::atoi(v)!=0; }();
     bool hc_coeff_warp=[] {const char* v=std::getenv("STRATA_DS41_HC_COEFF_WARP");return v && std::atoi(v)!=0;}();
+    bool hc_row_tokens=[] {const char* v=std::getenv("STRATA_DS41_HC_ROW_TOKENS");return v && std::atoi(v)!=0;}();
     bool hc_norm_q8=[] {const char* v=std::getenv("STRATA_DS41_HC_NORM_Q8");return v && std::atoi(v)!=0;}();
     bool norm_q8_first=[] {const char* v=std::getenv("STRATA_DS41_NORM_Q8_FIRST");return v&&std::atoi(v)!=0;}();
     bool query_reuse=[] {const char* v=std::getenv("STRATA_DS41_QUERY_REUSE");return v&&std::atoi(v)!=0;}();
@@ -352,6 +353,8 @@ public:
             }
         }
         std::fprintf(stderr,"strata-deepseek41: original first attention HC/norm/Q81 producer=%d; FFN/draft unchanged\n",norm_q8_first ? 1 : 0);
+        if(hc_row_tokens && !hc_norm_q8)throw std::runtime_error("HC row/token projection requires HC norm/Q81 producer");
+        std::fprintf(stderr,"strata-deepseek41: original HC row/token projections=%d\n",hc_row_tokens ? 1 : 0);
         if(hc_norm_q8){
             if(c.hidden!=5120 || c.hc!=4)throw std::runtime_error("HC norm/Q81 requires original flat width20480");
             for(auto& rp:ranks)for(int layer=0;layer<c.layers;++layer)for(const char* sub:{"attn","ffn"}){
@@ -459,14 +462,15 @@ public:
         const auto prefix = block(layer)+"hc_"+suffix;
         if(hc_norm_q8){
             const auto& m=r.w(prefix+"_fn.weight");
-            const bool wide=r.wide_il && tokens>=5 && tokens<=8;
-            const bool interleaved=!wide && tokens>1 && tokens<=4 && K::native_mmvq_il_supported(m.type,tokens,m.out);
+            const bool wide=!hc_row_tokens && r.wide_il && tokens>=5 && tokens<=8;
+            const bool interleaved=!hc_row_tokens && !wide && tokens>1 && tokens<=4 && K::native_mmvq_il_supported(m.type,tokens,m.out);
             const int cp=wide || interleaved ? K::native_q8_1_il_cp(tokens) : 0;
             void* q=r.buffers.at("q8")->p;void* il=cp ? r.buffers.at("q8_il")->p : nullptr;
             C::hc_rms_stats(r.f("residual",c.hidden*4),r.f("hc_norm_inverse",1),c.hidden*4,tokens,float(c.rms_eps),r.stream);
             C::norm_quant_q8(r.f("residual",c.hidden*4),r.f("hc_norm_inverse",1),nullptr,
                 r.f("flat_norm",c.hidden*4),q,il,c.hidden*4,tokens,cp,r.stream);
-            if(wide)K::native_mmvq_il_wide(m.type,m.storage->p,il,r.f("mix",24),m.in,m.out,tokens,r.stream);
+            if(hc_row_tokens)K::native_hc_q4_k_row_tokens(m.storage->p,q,r.f("mix",24),tokens,r.stream);
+            else if(wide)K::native_mmvq_il_wide(m.type,m.storage->p,il,r.f("mix",24),m.in,m.out,tokens,r.stream);
             else if(interleaved)K::native_mmvq_il(m.type,m.storage->p,q,il,r.f("mix",24),m.in,m.out,tokens,r.stream);
             else K::native_mmvq(m.type,m.storage->p,q,r.f("mix",24),m.in,m.out,tokens,r.stream);
         }else{
@@ -1031,6 +1035,7 @@ public:
         const bool candidate_prefetch_query=prefetch_query; prefetch_query=false;
         const bool candidate_norm_q8_first=norm_q8_first; norm_q8_first=false;
         const bool candidate_hc_norm_q8=hc_norm_q8; hc_norm_q8=false;
+        const bool candidate_hc_row_tokens=hc_row_tokens; hc_row_tokens=false;
         const bool candidate_hc_coeff_warp=hc_coeff_warp; hc_coeff_warp=false;
         const bool candidate_query_reuse=query_reuse; query_reuse=false;
         const bool candidate_value_async=value_async; value_async=false;
@@ -1067,6 +1072,7 @@ public:
         router_pipe=candidate_router_pipe;
         norm_q8_first=candidate_norm_q8_first;
         hc_norm_q8=candidate_hc_norm_q8;
+        hc_row_tokens=candidate_hc_row_tokens;
         hc_coeff_warp=candidate_hc_coeff_warp;
         query_reuse=candidate_query_reuse;
         value_async=candidate_value_async;
