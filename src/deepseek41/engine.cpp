@@ -202,6 +202,7 @@ public:
     bool grouped_oa = [] { const char* v=std::getenv("STRATA_DS41_GROUPED_OA"); return v && std::atoi(v)!=0; }();
     bool route_handoff = [] { const char* v=std::getenv("STRATA_DS41_ROUTE_HANDOFF"); return v && std::atoi(v)!=0; }();
     bool tp_graph = [] { const char* v=std::getenv("STRATA_DS41_TP_GRAPH"); return v && std::atoi(v)!=0; }();
+    bool hc_pre_norm = [] { const char* v=std::getenv("STRATA_DS41_HC_PRE_NORM"); return v && std::atoi(v)!=0; }();
     bool ffn_post_fuse = [] { const char* v=std::getenv("STRATA_DS41_FFN_POST_FUSE"); return v && std::atoi(v)!=0; }();
     bool ffn_graph = [] { const char* v=std::getenv("STRATA_DS41_FFN_GRAPH"); return v && std::atoi(v)!=0; }();
     bool normalize_attention = [] { const char* v=std::getenv("STRATA_DS41_ATTENTION_WEIGHTS"); return v && std::atoi(v)!=0; }();
@@ -238,6 +239,7 @@ public:
         *ffn_plan.p=FfnPlan{};
         std::fill_n(route_bell.p,route_bell.n,0u);
         std::fill_n(tp_ready.p,tp_ready.n,0u); *tp_abort.p=0;
+        if(hc_pre_norm && c.hidden!=5120) throw std::runtime_error("fused HC pre/RMS requires H5120");
         if(ffn_post_fuse && (!ffn_graph || !direct_ffn || hc_owner || tp_graph))
             throw std::runtime_error("fused FFN post requires original FFN graph, direct FFN, mirrored HC, CPU TP sum");
         if(ffn_graph && (gpu_count!=2 || tp_graph || !route_handoff || !direct_ffn || hc_owner))
@@ -399,13 +401,18 @@ public:
         r.mat(prefix+"_fn.weight",r.f("flat_norm",c.hidden*4),r.f("mix",24),tokens);
         C::hc_coeff(r.f("mix",24),r.weight(prefix+"_scale.weight"),r.weight(prefix+"_base.weight"),pre,r.f("post",4),r.f("comb",16),tokens,float(c.hc_eps),c.sinkhorn_iterations,r.stream);
     }
+    void pre_norm(Rank& r,const std::string& name,const float* pre,int tokens) {
+        const int H=c.hidden;
+        if(hc_pre_norm) C::hc_pre_rms(r.f("residual",H*4),pre,r.weight(name),r.f("x",H),r.f("norm",H),H,tokens,float(c.rms_eps),r.stream);
+        else { C::hc_pre(r.f("residual",H*4),pre,r.f("x",H),H,tokens,r.stream);
+            r.norm(name,r.f("x",H),r.f("norm",H),H,float(c.rms_eps),tokens); }
+    }
     void attention_prepare(Rank& r,int layer,int tokens) {
         const auto p = block(layer); const auto& streams = model.streams()[layer];
         const int H = c.hidden, D = c.head_dim, A = c.heads/r.count, ratio = int(c.compress_ratios[layer]);
         float* x = r.f("norm",H); float* qr = r.f("qr",c.q_rank);
         hc(r,layer,"attn",r.f("attn_pre",4),tokens);
-        C::hc_pre(r.f("residual",H*4),r.f("pre",4),r.f("x",H),H,tokens,r.stream);
-        r.norm(p+"attn_norm.weight",r.f("x",H),x,H,float(c.rms_eps),tokens);
+        pre_norm(r,p+"attn_norm.weight",r.f("pre",4),tokens);
         r.mat(p+"attn_q_a.weight",x,qr,tokens); r.norm(p+"attn_q_a_norm.weight",qr,qr,c.q_rank,float(c.rms_eps),tokens);
         r.mat(p+"attn_q_b.weight",qr,r.f("q",D*A),tokens); r.mat(p+"attn_kv.weight",x,r.f("kv",D),tokens);
         r.norm(p+"attn_kv_a_norm.weight",r.f("kv",D),r.f("kv",D),D,float(c.rms_eps),tokens);
@@ -599,8 +606,7 @@ public:
         const int H=c.hidden;
         C::hc_post(r.f("attn_sum",H),r.f("residual",H*4),r.f("post",4),r.f("comb",16),r.f("residual",H*4),H,tokens,r.stream);
         hc(r,layer,"ffn",r.f("pre",4),tokens);
-        C::hc_pre(r.f("residual",H*4),r.f("attn_pre",4),r.f("x",H),H,tokens,r.stream);
-        r.norm(block(layer)+"ffn_norm.weight",r.f("x",H),r.f("norm",H),H,float(c.rms_eps),tokens);
+        pre_norm(r,block(layer)+"ffn_norm.weight",r.f("attn_pre",4),tokens);
     }
     void route_prepare(Rank& r,int layer,int tokens) {
         const int H=c.hidden,entries=c.top_k*tokens; const auto p=block(layer); float* x=r.f("norm",H);
@@ -915,6 +921,7 @@ public:
         const bool candidate_tp_graph=tp_graph; tp_graph=false;
         const bool candidate_ffn_graph=ffn_graph; ffn_graph=false;
         const bool candidate_ffn_post_fuse=ffn_post_fuse; ffn_post_fuse=false;
+        const bool candidate_hc_pre_norm=hc_pre_norm; hc_pre_norm=false;
         const bool candidate_normalize_attention=normalize_attention; normalize_attention=false;
         const bool candidate_chunked_attention=chunked_attention; chunked_attention=false;
         const bool candidate_parallel_values=parallel_values; parallel_values=false;
@@ -948,6 +955,7 @@ public:
         tp_graph=candidate_tp_graph;
         ffn_graph=candidate_ffn_graph;
         ffn_post_fuse=candidate_ffn_post_fuse;
+        hc_pre_norm=candidate_hc_pre_norm;
         normalize_attention=candidate_normalize_attention;
         chunked_attention=candidate_chunked_attention;
         parallel_values=candidate_parallel_values;

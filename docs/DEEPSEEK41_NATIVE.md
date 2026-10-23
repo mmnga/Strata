@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N59 settings. From the checkout root, copy it to an ignored local file:
+N60 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -250,3 +250,23 @@ swap at READY with all409.518GiB resident. Operator tests compared
 44,236,800 values bitwise on both GPUs with NT1..8, capture on/off, mixed
 CPU/GPU masks and in-place HC. No new N59 API checkpoint;70tok/s remains
 unmet. N55 and earlier records remain available locally.
+
+
+N60 enables `STRATA_DS41_HC_PRE_NORM=1` for H5120. The attention and FFN
+HC pre-combinations and RMS normalization share one kernel. It retains the
+original four FMA order, 256-thread sum reduction, runtime divisor and F32
+multiplication order, and writes both original intermediate and normalized
+outputs. The original serial CHECK disables this option for its reference.
+Draft and output-head operators keep their previous paths.
+
+N60 measured **61.7051 tok/s** (4092 timed tokens /66.3154s), observed
++0.2464% versus N59. Standard EN/JA:62.0026/65.6480; held-out EN/JA:
+55.5106/64.7300 tok/s. This small single-suite gain does not establish
+statistical significance. All six generated sequences and draft counts
+matched N59. Actual batch8/rollback max_abs and relative_rms were zero;
+all case model disk reads/major faults and READY3-process swap were zero,
+with409.518GiB resident. Unit5,898,240 values matched bitwise on both GPUs,
+NT1..8, captureon/off and changing signedzero/subnormal inputs. A local
+operator gate measured1.05219x (15/16pairs faster), which is not a model
+speed prediction. Original F16C functions and numerical operator sources
+remain unchanged. No new N60 API checkpoint;70tok/s goal remains unmet.

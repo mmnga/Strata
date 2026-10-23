@@ -13,6 +13,10 @@ void hc_init(const float* embedding, float* residual, float* pre, int hidden, in
 void hc_coeff(const float* mixes, const float* scale, const float* base, float* pre, float* post,
               float* comb, int tokens, float eps, int iterations, void* stream);
 void hc_pre(const float* residual, const float* pre, float* y, int hidden, int tokens, void* stream);
+// H5120 HC pre plus original 256-thread RMS order; preserves both outputs.
+void hc_pre_rms(const float* residual,const float* pre,const float* weight,
+    float* x,float* normalized,int width,int tokens,float eps,void* stream);
+
 void hc_post(const float* x, const float* residual, const float* post, const float* comb,
              float* y, int hidden, int tokens, void* stream);
 // q/k weights are dequantized once at load. kv contains four keys, then one value.
