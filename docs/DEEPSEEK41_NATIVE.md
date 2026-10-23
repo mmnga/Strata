@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N91 settings. From the checkout root, copy it to an ignored local file:
+N93 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -657,3 +657,44 @@ had zero swap, and409.518GiB residency passed nine times. Cache slots
 stayed1225/846. Original Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math,
 lookahead2 and262144/F16KV remain.70tok/s is unmet; server stopped,
 no new API checkpoint. Changes remain local; no push.
+
+
+N93 adds `STRATA_DS41_HC_COEFF_PRE=1`. HC attention writes the next
+`attn_pre` coefficients while the current attention input consumes the
+lagged `pre` coefficients. HC FFN writes the next `pre` while the current
+FFN input consumes `attn_pre`. These independent calculations share one
+288-thread CTA per token: one coefficient warp and the original eight
+HC pre/RMS warps. The original20-iteration recurrence, FMA order, shuffle
+sums, runtime divisor and rounded normalization products remain intact.
+Two block barriers join the independent warps. No counters or spinning
+waits are introduced.
+
+Attention receives the same collapsed input and RMS inverse for N80's
+producer; FFN receives the same collapsed and normalized F32 inputs.
+The two separate preparation calls are skipped only when already done.
+The flag requires the adopted HC/first-norm paths and original5120/four-
+stream/20-iteration geometry. The default and DSpark remain unchanged.
+Serial CHECK clears it for the complete reference prefix. No buffers,
+weights, cache reservations or placement policy change.
+
+The fixed four-long aggregate measured **67.8192 tok/s**,4092 timed tokens /
+60.3369 seconds, versus N91's67.4701: observed **+0.5174%**. Standard
+English/Japanese measured66.4964/74.0907 and held-out English/Japanese
+59.6154/73.1488 tok/s; all four were faster. All six prompt/output ID
+sequences and DSpark accepted/offered counts matched N91. One changed
+candidate suite does not establish statistical significance.
+
+The two-GPU oracle matched33563979 F32 values,19470720 Q81/IL bytes
+and3186 route IDs at NT1..8 with changed captures, null gamma, whole-zero
+inputs, signed zero, subnormals and extreme coefficients. Aliasing the
+lagged and new pre buffers is rejected. The complete paired HC/attention-QA
+and HC/FFN-router/route gate used17 cold matrix banks,205762560 bytes,
+greater than twice the L2 capacity (201326592 bytes). Every actual matrix pointer, each
+288-thread fused launch and all bank outputs were checked. Fixed NT3
+measured1.08149x,16/16 balanced pairs faster, with14 versus12 kernels.
+This is a component result. Actual-model batch8/rollback CHECK had
+max_abs=0 and relative_rms=0. All inference disk reads and major faults
+were zero, READY's three processes had zero swap, and409.518GiB residency
+passed nine times. Cache slots stayed1225/846. Original Q4_K_M/F16C,
+DSpark MXFP4, TP2/all40,24math, lookahead2 and262144/F16KV remain.
+70tok/s is unmet; server stopped, no new API checkpoint. No push.
