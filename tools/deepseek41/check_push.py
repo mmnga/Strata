@@ -24,6 +24,7 @@ FILES = {
     "serve/deepseek41.py", "serve/frontend.py", "serve/server.py",
     "serve/test_deepseek41.py", "serve/test_family_name.py",
     "src/kernels/cuda/iq_kernels.cu", "src/kernels/cuda/native_mmvq.cu",
+    "src/kernels/cuda/deepseek41_hc_consumer.cuh",
     "src/program/generate.cpp", "tests/core/deepseek41_artifact_test.cpp",
     "tests/core/gguf_fixture.hpp", "tools/strata_tokenizer.py",
 }
