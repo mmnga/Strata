@@ -219,6 +219,8 @@ public:
     bool parallel_values = [] { const char* v=std::getenv("STRATA_DS41_ATTENTION_VALUES"); return v && std::atoi(v)!=0; }();
     bool prefetch_values = [] { const char* v=std::getenv("STRATA_DS41_VALUE_PREFETCH"); return v && std::atoi(v)!=0; }();
     bool prefetch_query = [] { const char* v=std::getenv("STRATA_DS41_QUERY_PREFETCH"); return v && std::atoi(v)!=0; }();
+    bool query_reuse=[] {const char* v=std::getenv("STRATA_DS41_QUERY_REUSE");return v&&std::atoi(v)!=0;}();
+    std::vector<int> query_capacity;
     bool value_async=[] {const char* v=std::getenv("STRATA_DS41_VALUE_ASYNC64");return v&&std::atoi(v)!=0;}();
     bool index_rank_batch=[] {const char* v=std::getenv("STRATA_DS41_INDEX_RANK_BATCH");return v&&std::atoi(v)!=0;}();
     bool score_grid = [] { const char* v=std::getenv("STRATA_DS41_SCORE_GRID"); return v && std::atoi(v)!=0; }();
@@ -328,6 +330,14 @@ public:
         std::fprintf(stderr,"strata-deepseek41: exact batched index ranking=%d; original stable score order\n",index_rank_batch ? 1 : 0);
         if(value_async && (!score_grid || !value_head_pair))throw std::runtime_error("async value staging requires original score-grid and paired-head path");
         std::fprintf(stderr,"strata-deepseek41: original paired attention values async64=%d; sequential FMA unchanged\n",value_async ? 1 : 0);
+        query_capacity.assign(ranks.size(),0);
+        if(query_reuse){
+            if(!value_async)throw std::runtime_error("query reuse requires the adopted asynchronous paired value path");
+            for(auto& rp:ranks){ck(cudaSetDevice(rp->id));int sms=0,blocks=0;
+                query_capacity.at(size_t(rp->rank))=C::attention_score_reuse_capacity(&sms,&blocks);
+                std::fprintf(stderr,"strata-deepseek41: original-order QK query reuse device=%d SMs=%d blocks_per_SM=%d capacity=%d\n",rp->id,sms,blocks,query_capacity.at(size_t(rp->rank)));
+            }
+        }
         resident.load(model);
         enable_cache(cache_mib,depth);
         std::fprintf(stderr,"strata-deepseek41: native Strata driver, TP=%d all %d layers, CPU math threads=%d, context=%d F16 KV\n",gpu_count,c.layers,cpu.threads(),context);
@@ -520,7 +530,7 @@ public:
         if(score_grid){
             if(value_async) C::attention_positions_score_grid_async(r.f("q",D*A),r.raw[layer]->h(),ratio ? r.compressed[streams.kv_source]->h() : nullptr,
                 ratio ? r.selected[streams.top_k_source]->i() : nullptr,r.weight(p+"attn_sinks.weight")+size_t(r.rank)*A,r.f("attn",D*A),
-                r.buffers.at("attention_values")->p,D,A,tokens,c.sliding_window,pos,ratio,ratio ? c.index_top_k : 0,context,c.sliding_window+Batch,r.stream);
+                r.buffers.at("attention_values")->p,D,A,tokens,c.sliding_window,pos,ratio,ratio ? c.index_top_k : 0,context,c.sliding_window+Batch,r.stream,query_reuse ? query_capacity.at(size_t(r.rank)) : 0);
             else C::attention_positions_score_grid(r.f("q",D*A),r.raw[layer]->h(),ratio ? r.compressed[streams.kv_source]->h() : nullptr,
             ratio ? r.selected[streams.top_k_source]->i() : nullptr,r.weight(p+"attn_sinks.weight")+size_t(r.rank)*A,r.f("attn",D*A),
             r.buffers.at("attention_values")->p,D,A,tokens,c.sliding_window,pos,ratio,ratio ? c.index_top_k : 0,context,c.sliding_window+Batch,r.stream,value_head_pair);
@@ -962,6 +972,7 @@ public:
         const bool candidate_parallel_values=parallel_values; parallel_values=false;
         const bool candidate_prefetch_values=prefetch_values; prefetch_values=false;
         const bool candidate_prefetch_query=prefetch_query; prefetch_query=false;
+        const bool candidate_query_reuse=query_reuse; query_reuse=false;
         const bool candidate_value_async=value_async; value_async=false;
         const bool candidate_index_rank_batch=index_rank_batch; index_rank_batch=false;
         const bool candidate_score_grid=score_grid; score_grid=false;
@@ -994,6 +1005,7 @@ public:
         ffn_post_fuse=candidate_ffn_post_fuse;
         hc_pre_norm=candidate_hc_pre_norm;
         router_pipe=candidate_router_pipe;
+        query_reuse=candidate_query_reuse;
         value_async=candidate_value_async;
         index_rank_batch=candidate_index_rank_batch;
         normalize_attention=candidate_normalize_attention;

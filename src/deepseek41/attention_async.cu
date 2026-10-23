@@ -36,7 +36,7 @@ __device__ float maximum(float v) {
     __syncthreads();
     return result;
 }
-__global__ void attention_score_grid_kernel(const float* q,const half* raw,const half* comp,
+template<bool Reuse> __global__ void attention_score_grid_kernel(const float* q,const half* raw,const half* comp,
     const int32_t* ids,float* scores,unsigned long long* pointers,int d,int heads,int window,
     const int32_t* positions,int ratio,int max_selected,int ids_stride,int capacity,int stride) {
     const int token=blockIdx.y,head=blockIdx.x,lane=threadIdx.x%32,warp=threadIdx.x/32;
@@ -51,11 +51,14 @@ __global__ void attention_score_grid_kernel(const float* q,const half* raw,const
     const int row=base+warp;
     if(row>=n) return; // Entire warp returns; all query loads already completed.
     if(ids) ids+=size_t(token)*ids_stride;
-    const half* key=row<nr ? raw+size_t((first+row)%capacity)*d :
-        comp+size_t(ids ? ids[row-nr] : row-nr)*d;
-    float query_fragment[16];uint16_t fragment[16];
+    float query_fragment[16];
 #pragma unroll
     for(int k=0;k<16;++k) query_fragment[k]=query[lane+32*k];
+    for(int current=row;current<n;current+=int(gridDim.z)*8){
+        const int row=current;
+    const half* key=row<nr ? raw+size_t((first+row)%capacity)*d :
+        comp+size_t(ids ? ids[row-nr] : row-nr)*d;
+        uint16_t fragment[16];
 #pragma unroll
     for(int k=0;k<16;++k) fragment[k]=reinterpret_cast<const uint16_t*>(key)[lane+32*k];
     float dot=0;
@@ -65,7 +68,9 @@ __global__ void attention_score_grid_kernel(const float* q,const half* raw,const
     if(!lane) {
         scores[slot*stride+row]=dot*rsqrtf(float(d));
         pointers[slot*stride+row]=reinterpret_cast<unsigned long long>(key);
+    }        if constexpr (!Reuse) break;
     }
+
 }
 __global__ void attention_score_softmax_kernel(float* weights,const float* sinks,int heads,int window,
     const int32_t* positions,int ratio,int max_selected,int stride) {
@@ -136,9 +141,19 @@ __global__ void attention_value_async_kernel(const float*weights,const unsigned 
 }
 }
 
+int attention_score_reuse_capacity(int* sms,int* resident_blocks){
+    int device=0,multiprocessors=0,blocks=0;
+    auto check=[](cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));};
+    check(cudaGetDevice(&device));
+    check(cudaDeviceGetAttribute(&multiprocessors,cudaDevAttrMultiProcessorCount,device));
+    check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,attention_score_grid_kernel<true>,threads,0));
+    if(multiprocessors<1 || blocks<1)throw std::runtime_error("query-reuse occupancy unavailable");
+    if(sms)*sms=multiprocessors;if(resident_blocks)*resident_blocks=blocks;
+    return multiprocessors*blocks;
+}
 void attention_positions_score_grid_async(const float* q,const uint16_t* raw,const uint16_t* comp,const int32_t* ids,
     const float* sinks,float* out,void* scratch,int d,int heads,int tokens,int window,const int32_t* pos,
-    int ratio,int max_selected,int ids_stride,int raw_capacity,void* s) {
+    int ratio,int max_selected,int ids_stride,int raw_capacity,void* s,int qk_capacity) {
     if(d!=512 || heads<1 || tokens<1 || tokens>8 || window!=128 || raw_capacity<window+tokens ||
        ratio<0 || ratio>2 || (max_selected!=0 && max_selected!=512) || (ratio && !comp) || !scratch || heads%2)
         throw std::invalid_argument("DeepSeek score-grid geometry");
@@ -146,9 +161,19 @@ void attention_positions_score_grid_async(const float* q,const uint16_t* raw,con
     const size_t count=size_t(heads)*tokens*stride;
     auto* weights=static_cast<float*>(scratch);
     auto* rows=reinterpret_cast<unsigned long long*>(static_cast<unsigned char*>(scratch)+((count*4+255)&~size_t(255)));
-    attention_score_grid_kernel<<<dim3(heads,tokens,(stride+7)/8),threads,0,stream_cast(s)>>>(q,
+    if(qk_capacity>0){
+        // One resident wave, spread across all head/token pairs. Each warp then
+        // reuses its original query fragment for its remaining key rows.
+        int z=qk_capacity/(heads*tokens);z=z<1?1:z;
+        z=z<(stride+7)/8?z:(stride+7)/8;
+        attention_score_grid_kernel<true><<<dim3(heads,tokens,z),threads,0,stream_cast(s)>>>(q,
+            reinterpret_cast<const half*>(raw),reinterpret_cast<const half*>(comp),ids,weights,rows,d,heads,window,
+            pos,ratio,max_selected,ids_stride,raw_capacity,stride);
+    }else{
+    attention_score_grid_kernel<false><<<dim3(heads,tokens,(stride+7)/8),threads,0,stream_cast(s)>>>(q,
         reinterpret_cast<const half*>(raw),reinterpret_cast<const half*>(comp),ids,weights,rows,d,heads,window,
         pos,ratio,max_selected,ids_stride,raw_capacity,stride);
+    }
     attention_score_softmax_kernel<<<dim3(heads,tokens),threads,size_t(stride)*4,stream_cast(s)>>>(weights,sinks,
         heads,window,pos,ratio,max_selected,stride);
     const size_t shared=size_t(stride)*(2*sizeof(float)+sizeof(unsigned long long))+2*64*64*sizeof(uint16_t);

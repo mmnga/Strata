@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N78 settings. From the checkout root, copy it to an ignored local file:
+N79 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -408,3 +408,36 @@ nine times. Cache slots remained1225/846, reserve1536MiB per GPU.
 Original target Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math, lookahead2
 and262144/F16KV remain. Server stopped; no new API checkpoint. The70tok/s
 goal is unmet. All changes and commits remain local; no push.
+
+
+N79 adds `STRATA_DS41_QUERY_REUSE=1`, requiring N78's asynchronous value
+path. Each QK warp reuses its original 16 query fragments for more key
+rows, retaining each key's 16 FMAs and shuffle reduction in their original
+order. CUDA's one-time occupancy query reports 170 SMs and five resident
+256-thread CTAs per SM on each tested GPU. The launch uses that 850-CTA
+capacity divided across head/token pairs, capped by the original row grid.
+No timing-selected grid or warp-count setting is used. The capability
+query runs before capture; the host caches its result. Softmax, values,
+global buffers, weights, KV storage and cache capacity are unchanged.
+The option defaults off; capacity zero retains the original QK path.
+
+The fixed long4 aggregate was **63.7420 tok/s**, 4092 timed tokens /
+64.1963 seconds, versus N78's 63.6465: observed **+0.1500%**. Standard
+English/Japanese measured63.2551/68.6988 and held-out English/Japanese
+56.7039/67.7865 tok/s. All four were slightly faster; all six prompt/output
+ID sequences and DSpark counts matched N78. This small difference may
+include timing noise; one changed-candidate suite does not establish
+statistical significance.
+
+The two-GPU original/adopted/new attention oracle matched35389440 candidate
+values bitwise, plus786432 paired gate values. It covers NT1..8,
+ratios0/1/2, ring wrap, full context, changed graph inputs and F16 edges.
+The complete attention local gate at NT3/head32/D512/ratio2/640rows was
+1.11009x,16/16 pairs faster, excluding projections/index ranking. It is
+not a whole-model speedup. Actual-model batch8/rollback CHECK had
+max_abs=0 and relative_rms=0. Every inference disk-read and major-fault
+delta was zero; READY's three processes had zero swap, and409.518GiB
+residency passed nine times. Slots1225/846 and reserve1536MiB stayed fixed.
+Original target Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math, lookahead2 and
+262144/F16KV remain. Server stopped; no new API checkpoint.70tok/s remains
+unmet. All changes and commits remain local; no push.
