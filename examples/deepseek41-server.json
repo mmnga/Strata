@@ -68,7 +68,8 @@
     "STRATA_DS41_DSPARK_CONDITIONAL_HEAD": "1",
     "STRATA_DS41_INDEX_RANK_BATCH": "1",
     "STRATA_DS41_VALUE_ASYNC64": "1",
-    "STRATA_DS41_QUERY_REUSE": "1"
+    "STRATA_DS41_QUERY_REUSE": "1",
+    "STRATA_DS41_NORM_Q8_FIRST": "1"
   },
   "sampling": {
     "temperature": 0,

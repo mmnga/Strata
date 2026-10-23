@@ -2,6 +2,7 @@
 #include "strata/deepseek41/dspark_head.hpp"
 #include "strata/deepseek41/index_rank.hpp"
 #include "strata/deepseek41/attention_async.hpp"
+#include "strata/deepseek41/norm_quant.hpp"
 #include "strata/deepseek41/model.hpp"
 #include "strata/deepseek41/resident.hpp"
 #include "strata/deepseek41/cpu_experts.hpp"
@@ -219,6 +220,7 @@ public:
     bool parallel_values = [] { const char* v=std::getenv("STRATA_DS41_ATTENTION_VALUES"); return v && std::atoi(v)!=0; }();
     bool prefetch_values = [] { const char* v=std::getenv("STRATA_DS41_VALUE_PREFETCH"); return v && std::atoi(v)!=0; }();
     bool prefetch_query = [] { const char* v=std::getenv("STRATA_DS41_QUERY_PREFETCH"); return v && std::atoi(v)!=0; }();
+    bool norm_q8_first=[] {const char* v=std::getenv("STRATA_DS41_NORM_Q8_FIRST");return v&&std::atoi(v)!=0;}();
     bool query_reuse=[] {const char* v=std::getenv("STRATA_DS41_QUERY_REUSE");return v&&std::atoi(v)!=0;}();
     std::vector<int> query_capacity;
     bool value_async=[] {const char* v=std::getenv("STRATA_DS41_VALUE_ASYNC64");return v&&std::atoi(v)!=0;}();
@@ -338,6 +340,14 @@ public:
                 std::fprintf(stderr,"strata-deepseek41: original-order QK query reuse device=%d SMs=%d blocks_per_SM=%d capacity=%d\n",rp->id,sms,blocks,query_capacity.at(size_t(rp->rank)));
             }
         }
+        if(norm_q8_first){
+            if(!hc_pre_norm || c.hidden!=5120 || c.q_rank!=1280)throw std::runtime_error("first norm/Q81 requires original HCpre/RMS H5120 Q1280");
+            for(auto& rp:ranks)for(int layer=0;layer<c.layers;++layer){const auto p=block(layer);
+                const auto& qa=rp->w(p+"attn_q_a.weight");const auto& norm=rp->w(p+"attn_norm.weight");
+                if(qa.type!=12 || qa.in!=5120 || qa.out!=1280 || norm.type!=0)throw std::runtime_error("first norm/Q81 requires original Q4_K QA and F32 norm");
+            }
+        }
+        std::fprintf(stderr,"strata-deepseek41: original first attention HC/norm/Q81 producer=%d; FFN/draft unchanged\n",norm_q8_first ? 1 : 0);
         resident.load(model);
         enable_cache(cache_mib,depth);
         std::fprintf(stderr,"strata-deepseek41: native Strata driver, TP=%d all %d layers, CPU math threads=%d, context=%d F16 KV\n",gpu_count,c.layers,cpu.threads(),context);
@@ -386,6 +396,7 @@ public:
     }
     void allocate(Rank& r) {
         const size_t H = c.hidden, D = c.head_dim, A = c.heads/r.count, I = c.index_dim, F = c.expert_ff*c.shared_experts;
+        if(norm_q8_first)r.f("norm_inverse",1); // Allocated before capture.
         r.f("residual",H*4); r.f("flat_norm",H*4); r.f("pre",4); r.f("attn_pre",4); r.f("post",4); r.f("comb",16); r.f("mix",24);
         r.f("x",H); r.f("norm",H); r.f("qr",c.q_rank); r.f("q",D*A); r.f("kv",D); r.f("attn",D*A);
         r.f("oa",size_t(c.o_rank)*c.o_groups/r.count); r.f("partial",H); r.f("attn_sum",H);
@@ -444,8 +455,23 @@ public:
         const int H = c.hidden, D = c.head_dim, A = c.heads/r.count, ratio = int(c.compress_ratios[layer]);
         float* x = r.f("norm",H); float* qr = r.f("qr",c.q_rank);
         hc(r,layer,"attn",r.f("attn_pre",4),tokens);
-        pre_norm(r,p+"attn_norm.weight",r.f("pre",4),tokens);
-        r.mat(p+"attn_q_a.weight",x,qr,tokens); r.norm(p+"attn_q_a_norm.weight",qr,qr,c.q_rank,float(c.rms_eps),tokens);
+        if(norm_q8_first){
+            C::hc_pre_stats(r.f("residual",H*4),r.f("pre",4),r.f("x",H),r.f("norm_inverse",1),H,tokens,float(c.rms_eps),r.stream);
+            const auto& qa=r.w(p+"attn_q_a.weight");
+            const bool wide=r.wide_il && tokens>=5 && tokens<=8;
+            const bool interleaved=!wide && tokens>1 && tokens<=4 && K::native_mmvq_il_supported(qa.type,tokens,qa.out);
+            const int cp=wide || interleaved ? K::native_q8_1_il_cp(tokens) : 0;
+            void* q=r.buffers.at("q8")->p;void* il=cp ? r.buffers.at("q8_il")->p : nullptr;
+            C::norm_quant_q8(r.f("x",H),r.f("norm_inverse",1),r.weight(p+"attn_norm.weight"),x,q,il,H,tokens,cp,r.stream);
+            // Consume this producer once, immediately. No cross-projection ready cache.
+            if(wide)K::native_mmvq_il_wide(qa.type,qa.storage->p,il,qr,qa.in,qa.out,tokens,r.stream);
+            else if(interleaved)K::native_mmvq_il(qa.type,qa.storage->p,q,il,qr,qa.in,qa.out,tokens,r.stream);
+            else K::native_mmvq(qa.type,qa.storage->p,q,qr,qa.in,qa.out,tokens,r.stream);
+        }else{
+            pre_norm(r,p+"attn_norm.weight",r.f("pre",4),tokens);
+            r.mat(p+"attn_q_a.weight",x,qr,tokens);
+        }
+        r.norm(p+"attn_q_a_norm.weight",qr,qr,c.q_rank,float(c.rms_eps),tokens);
         r.mat(p+"attn_q_b.weight",qr,r.f("q",D*A),tokens); r.mat(p+"attn_kv.weight",x,r.f("kv",D),tokens);
         r.norm(p+"attn_kv_a_norm.weight",r.f("kv",D),r.f("kv",D),D,float(c.rms_eps),tokens);
         C::rope(r.f("q",D*A),D,A,tokens,r.buffer("position",4).i(),rope_config(layer),false,r.stream);
@@ -972,6 +998,7 @@ public:
         const bool candidate_parallel_values=parallel_values; parallel_values=false;
         const bool candidate_prefetch_values=prefetch_values; prefetch_values=false;
         const bool candidate_prefetch_query=prefetch_query; prefetch_query=false;
+        const bool candidate_norm_q8_first=norm_q8_first; norm_q8_first=false;
         const bool candidate_query_reuse=query_reuse; query_reuse=false;
         const bool candidate_value_async=value_async; value_async=false;
         const bool candidate_index_rank_batch=index_rank_batch; index_rank_batch=false;
@@ -1005,6 +1032,7 @@ public:
         ffn_post_fuse=candidate_ffn_post_fuse;
         hc_pre_norm=candidate_hc_pre_norm;
         router_pipe=candidate_router_pipe;
+        norm_q8_first=candidate_norm_q8_first;
         query_reuse=candidate_query_reuse;
         value_async=candidate_value_async;
         index_rank_batch=candidate_index_rank_batch;

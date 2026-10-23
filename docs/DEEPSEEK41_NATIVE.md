@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N79 settings. From the checkout root, copy it to an ignored local file:
+N80 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -441,3 +441,43 @@ residency passed nine times. Slots1225/846 and reserve1536MiB stayed fixed.
 Original target Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math, lookahead2 and
 262144/F16KV remain. Server stopped; no new API checkpoint.70tok/s remains
 unmet. All changes and commits remain local; no push.
+
+
+N80 adds `STRATA_DS41_NORM_Q8_FIRST=1`, requiring the adopted HC pre/RMS
+path and the original Q4_K attention Q_A matrices5120x1280 with F32 norm
+weights. HC collapse and the original256-thread RMS reduction first write
+x and its inverse RMS. A parallel producer applies the same two rounded
+F32 normalization multiplies and writes the original Q8_1 bytes, followed
+immediately by the unchanged first Q_A projection. Both paths use three
+kernels. This distributes norm application and avoids a normalized-input
+reload; it does not reuse quantization across later projections, shared
+experts or the draft. Inverse storage adds32 bytes per rank before capture.
+
+The producer retains native_mmvq's per-file fast-math quantizer contract;
+explicit non-FTZ `mul.rn.f32` instructions retain the original strict norm
+multiplication order and subnormals. HC/RMS statistics stay in a separate
+strict CUDA file. Other DeepSeek math files and CPU F16C are unchanged.
+On the tested hardware the1280-row first projection uses plain Q8_1 at
+NT1..4 and wide IL/CP8 at NT5..8. Serial CHECK clears the option throughout
+its reference prefix. The option defaults off; the example enables it.
+
+The fixed long4 aggregate was **64.2089 tok/s**,4092 timed tokens /
+63.7295 seconds, versus N79's63.7420: observed **+0.7325%**. Standard
+English/Japanese measured63.6574/69.2540 and held-out English/Japanese
+57.0524/68.3984 tok/s. All four were faster; all six prompt/output ID
+sequences and DSpark counts matched N79. One changed-candidate suite does
+not establish statistical significance.
+
+The two-GPU component oracle matched2511578 F32 values and3344640
+plain/interleaved Q8_1 bytes exactly at NT1..8, with changed graph inputs,
+zero blocks, signed zero, F32 subnormals and explicit null-weight captures.
+The complete cold HC/pre/RMS/quant/Q_A gate used55 distinct matrices,
+202752000 bytes, greater than twice reported L2100663296 bytes. Captured
+weight pointers and every bank's outputs were checked. At fixed NT3, its
+ratio was1.19372x,16/16 balanced pairs faster; this is not a model speedup.
+Actual-model batch8/rollback CHECK had max_abs=0 and relative_rms=0. All
+inference reads and major faults were zero, READY's three processes had
+zero swap, and409.518GiB residency passed nine times. Cache slots stayed
+1225/846 with1536MiB reserve per GPU. Original Q4_K_M, DSpark MXFP4,
+TP2/all40,24math, lookahead2 and262144/F16KV remain. Server stopped;
+no new API checkpoint;70tok/s remains unmet. No push.
