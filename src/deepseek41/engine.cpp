@@ -223,6 +223,7 @@ public:
     bool prefetch_values = [] { const char* v=std::getenv("STRATA_DS41_VALUE_PREFETCH"); return v && std::atoi(v)!=0; }();
     bool prefetch_query = [] { const char* v=std::getenv("STRATA_DS41_QUERY_PREFETCH"); return v && std::atoi(v)!=0; }();
     bool hc_coeff_warp=[] {const char* v=std::getenv("STRATA_DS41_HC_COEFF_WARP");return v && std::atoi(v)!=0;}();
+    bool hc_norm_q8=[] {const char* v=std::getenv("STRATA_DS41_HC_NORM_Q8");return v && std::atoi(v)!=0;}();
     bool norm_q8_first=[] {const char* v=std::getenv("STRATA_DS41_NORM_Q8_FIRST");return v&&std::atoi(v)!=0;}();
     bool query_reuse=[] {const char* v=std::getenv("STRATA_DS41_QUERY_REUSE");return v&&std::atoi(v)!=0;}();
     std::vector<int> query_capacity;
@@ -351,6 +352,15 @@ public:
             }
         }
         std::fprintf(stderr,"strata-deepseek41: original first attention HC/norm/Q81 producer=%d; FFN/draft unchanged\n",norm_q8_first ? 1 : 0);
+        if(hc_norm_q8){
+            if(c.hidden!=5120 || c.hc!=4)throw std::runtime_error("HC norm/Q81 requires original flat width20480");
+            for(auto& rp:ranks)for(int layer=0;layer<c.layers;++layer)for(const char* sub:{"attn","ffn"}){
+                const auto& m=rp->w(block(layer)+"hc_"+sub+"_fn.weight");
+                if(m.type!=12 || m.in!=20480 || m.out!=24)
+                    throw std::runtime_error("HC norm/Q81 requires original Q4_K 20480x24 matrices");
+            }
+        }
+        std::fprintf(stderr,"strata-deepseek41: original flat HC norm/Q81 producer=%d\n",hc_norm_q8 ? 1 : 0);
         if(hc_coeff_warp && (c.hc!=4 || c.sinkhorn_iterations!=20))
             throw std::runtime_error("warp HC coefficients require original four-stream/twenty-iteration model");
         std::fprintf(stderr,"strata-deepseek41: original ordered warp HC coefficients=%d\n",hc_coeff_warp ? 1 : 0);
@@ -403,6 +413,7 @@ public:
     void allocate(Rank& r) {
         const size_t H = c.hidden, D = c.head_dim, A = c.heads/r.count, I = c.index_dim, F = c.expert_ff*c.shared_experts;
         if(norm_q8_first)r.f("norm_inverse",1); // Allocated before capture.
+        if(hc_norm_q8)r.f("hc_norm_inverse",1); //32 bytes/rank, before capture.
         r.f("residual",H*4); r.f("flat_norm",H*4); r.f("pre",4); r.f("attn_pre",4); r.f("post",4); r.f("comb",16); r.f("mix",24);
         r.f("x",H); r.f("norm",H); r.f("qr",c.q_rank); r.f("q",D*A); r.f("kv",D); r.f("attn",D*A);
         r.f("oa",size_t(c.o_rank)*c.o_groups/r.count); r.f("partial",H); r.f("attn_sum",H);
@@ -446,8 +457,22 @@ public:
     }
     void hc(Rank& r,int layer,const char* suffix,float* pre,int tokens = 1) {
         const auto prefix = block(layer)+"hc_"+suffix;
-        C::rms(r.f("residual",c.hidden*4),nullptr,r.f("flat_norm",c.hidden*4),c.hidden*4,tokens,float(c.rms_eps),r.stream);
-        r.mat(prefix+"_fn.weight",r.f("flat_norm",c.hidden*4),r.f("mix",24),tokens);
+        if(hc_norm_q8){
+            const auto& m=r.w(prefix+"_fn.weight");
+            const bool wide=r.wide_il && tokens>=5 && tokens<=8;
+            const bool interleaved=!wide && tokens>1 && tokens<=4 && K::native_mmvq_il_supported(m.type,tokens,m.out);
+            const int cp=wide || interleaved ? K::native_q8_1_il_cp(tokens) : 0;
+            void* q=r.buffers.at("q8")->p;void* il=cp ? r.buffers.at("q8_il")->p : nullptr;
+            C::hc_rms_stats(r.f("residual",c.hidden*4),r.f("hc_norm_inverse",1),c.hidden*4,tokens,float(c.rms_eps),r.stream);
+            C::norm_quant_q8(r.f("residual",c.hidden*4),r.f("hc_norm_inverse",1),nullptr,
+                r.f("flat_norm",c.hidden*4),q,il,c.hidden*4,tokens,cp,r.stream);
+            if(wide)K::native_mmvq_il_wide(m.type,m.storage->p,il,r.f("mix",24),m.in,m.out,tokens,r.stream);
+            else if(interleaved)K::native_mmvq_il(m.type,m.storage->p,q,il,r.f("mix",24),m.in,m.out,tokens,r.stream);
+            else K::native_mmvq(m.type,m.storage->p,q,r.f("mix",24),m.in,m.out,tokens,r.stream);
+        }else{
+            C::rms(r.f("residual",c.hidden*4),nullptr,r.f("flat_norm",c.hidden*4),c.hidden*4,tokens,float(c.rms_eps),r.stream);
+            r.mat(prefix+"_fn.weight",r.f("flat_norm",c.hidden*4),r.f("mix",24),tokens);
+        }
         (hc_coeff_warp ? C::hc_coeff_warp : C::hc_coeff)(r.f("mix",24),r.weight(prefix+"_scale.weight"),r.weight(prefix+"_base.weight"),pre,r.f("post",4),r.f("comb",16),tokens,float(c.hc_eps),c.sinkhorn_iterations,r.stream);
     }
     void pre_norm(Rank& r,const std::string& name,const float* pre,int tokens) {
@@ -1005,6 +1030,7 @@ public:
         const bool candidate_prefetch_values=prefetch_values; prefetch_values=false;
         const bool candidate_prefetch_query=prefetch_query; prefetch_query=false;
         const bool candidate_norm_q8_first=norm_q8_first; norm_q8_first=false;
+        const bool candidate_hc_norm_q8=hc_norm_q8; hc_norm_q8=false;
         const bool candidate_hc_coeff_warp=hc_coeff_warp; hc_coeff_warp=false;
         const bool candidate_query_reuse=query_reuse; query_reuse=false;
         const bool candidate_value_async=value_async; value_async=false;
@@ -1040,6 +1066,7 @@ public:
         hc_pre_norm=candidate_hc_pre_norm;
         router_pipe=candidate_router_pipe;
         norm_q8_first=candidate_norm_q8_first;
+        hc_norm_q8=candidate_hc_norm_q8;
         hc_coeff_warp=candidate_hc_coeff_warp;
         query_reuse=candidate_query_reuse;
         value_async=candidate_value_async;

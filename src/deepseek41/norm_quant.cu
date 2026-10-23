@@ -44,7 +44,7 @@ __global__ void producer(const float*x,const float*inv,const float*w,float*norma
 }
 }
 void norm_quant_q8(const float*x,const float*inv,const float*w,float*norm,void*q8,void*il,int H,int tokens,int cp,void*stream){
- if(H!=5120||tokens<1||tokens>8||!stream||(cp!=0&&cp!=2&&cp!=4&&cp!=8)||(cp&&cp<tokens)||(cp&&!il))throw std::invalid_argument("norm/Q81 geometry");
+ if((H!=5120&&H!=20480)||tokens<1||tokens>8||!stream||(cp!=0&&cp!=2&&cp!=4&&cp!=8)||(cp&&cp<tokens)||(cp&&!il))throw std::invalid_argument("norm/Q81 geometry");
  const size_t plane=size_t(H/32)*8*cp;auto*bm=static_cast<int*>(il);auto*pm=cp?bm+plane:nullptr;auto*dl=cp?reinterpret_cast<float*>(pm+plane):nullptr;
  producer<<<(H*tokens+255)/256,256,0,static_cast<cudaStream_t>(stream)>>>(x,inv,w,norm,static_cast<Q81*>(q8),bm,pm,dl,H,H*tokens,cp);
 }
