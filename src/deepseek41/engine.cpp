@@ -202,6 +202,7 @@ public:
     bool grouped_oa = [] { const char* v=std::getenv("STRATA_DS41_GROUPED_OA"); return v && std::atoi(v)!=0; }();
     bool route_handoff = [] { const char* v=std::getenv("STRATA_DS41_ROUTE_HANDOFF"); return v && std::atoi(v)!=0; }();
     bool tp_graph = [] { const char* v=std::getenv("STRATA_DS41_TP_GRAPH"); return v && std::atoi(v)!=0; }();
+    bool ffn_post_fuse = [] { const char* v=std::getenv("STRATA_DS41_FFN_POST_FUSE"); return v && std::atoi(v)!=0; }();
     bool ffn_graph = [] { const char* v=std::getenv("STRATA_DS41_FFN_GRAPH"); return v && std::atoi(v)!=0; }();
     bool normalize_attention = [] { const char* v=std::getenv("STRATA_DS41_ATTENTION_WEIGHTS"); return v && std::atoi(v)!=0; }();
     bool chunked_attention = [] { const char* v=std::getenv("STRATA_DS41_ATTENTION_CHUNKS"); return v && std::atoi(v)!=0; }();
@@ -237,6 +238,8 @@ public:
         *ffn_plan.p=FfnPlan{};
         std::fill_n(route_bell.p,route_bell.n,0u);
         std::fill_n(tp_ready.p,tp_ready.n,0u); *tp_abort.p=0;
+        if(ffn_post_fuse && (!ffn_graph || !direct_ffn || hc_owner || tp_graph))
+            throw std::runtime_error("fused FFN post requires original FFN graph, direct FFN, mirrored HC, CPU TP sum");
         if(ffn_graph && (gpu_count!=2 || tp_graph || !route_handoff || !direct_ffn || hc_owner))
             throw std::runtime_error("FFN graph requires TP2, route handoff, direct FFN, mirrored HC and TP graph disabled");
         if(tp_graph && (gpu_count!=2 || !route_handoff || !attention_replay || hc_owner))
@@ -702,10 +705,16 @@ public:
         }
         auto combine=[&] {
             if(direct_ffn) {
-                const auto fn=ffn_graph ? C::combine_sources_system : C::combine_sources;
-                fn(r.f("parts",size_t(H)*c.top_k),r.mapped_cpu_parts,
-                &static_cast<FfnPlan*>(r.buffers.at("ffn_plan")->p)->gpu_mask,r.f("route_weights",c.top_k),
-                r.f("shared",H),r.f("ffn",H),H,c.top_k,tokens,r.stream);
+                if(ffn_post_fuse) {
+                    C::combine_sources_post_system(r.f("parts",size_t(H)*c.top_k),r.mapped_cpu_parts,
+                        &static_cast<FfnPlan*>(r.buffers.at("ffn_plan")->p)->gpu_mask,r.f("route_weights",c.top_k),
+                        r.f("shared",H),r.f("ffn",H),r.f("residual",H*4),r.f("post",4),r.f("comb",16),H,c.top_k,tokens,r.stream);
+                } else {
+                    const auto fn=ffn_graph ? C::combine_sources_system : C::combine_sources;
+                    fn(r.f("parts",size_t(H)*c.top_k),r.mapped_cpu_parts,
+                    &static_cast<FfnPlan*>(r.buffers.at("ffn_plan")->p)->gpu_mask,r.f("route_weights",c.top_k),
+                    r.f("shared",H),r.f("ffn",H),H,c.top_k,tokens,r.stream);
+                }
             } else C::combine(r.f("parts",size_t(H)*c.top_k),r.f("route_weights",c.top_k),r.f("shared",H),r.f("ffn",H),H,c.top_k,tokens,r.stream);
         };
         if (!gpu_groups.empty()) {
@@ -800,7 +809,8 @@ public:
                 ck(cudaMemcpyAsync(other->f("pre",4),hc_transfer.p+size_t(H)*4*Batch,size_t(tokens)*4*4,cudaMemcpyHostToDevice,other->stream));
             } else {
                 if (other.get() != &r) ck(cudaMemcpyAsync(other->f("ffn",H),transfer.p,size_t(H)*tokens*4,cudaMemcpyHostToDevice,other->stream));
-                C::hc_post(other->f("ffn",H),other->f("residual",H*4),other->f("post",4),other->f("comb",16),other->f("residual",H*4),H,tokens,other->stream);
+                if(!ffn_post_fuse || other.get()!=&r)
+                    C::hc_post(other->f("ffn",H),other->f("residual",H*4),other->f("post",4),other->f("comb",16),other->f("residual",H*4),H,tokens,other->stream);
             }
         }
     }
@@ -904,6 +914,7 @@ public:
         const bool candidate_route_handoff=route_handoff; route_handoff=false;
         const bool candidate_tp_graph=tp_graph; tp_graph=false;
         const bool candidate_ffn_graph=ffn_graph; ffn_graph=false;
+        const bool candidate_ffn_post_fuse=ffn_post_fuse; ffn_post_fuse=false;
         const bool candidate_normalize_attention=normalize_attention; normalize_attention=false;
         const bool candidate_chunked_attention=chunked_attention; chunked_attention=false;
         const bool candidate_parallel_values=parallel_values; parallel_values=false;
@@ -936,6 +947,7 @@ public:
         route_handoff=candidate_route_handoff;
         tp_graph=candidate_tp_graph;
         ffn_graph=candidate_ffn_graph;
+        ffn_post_fuse=candidate_ffn_post_fuse;
         normalize_attention=candidate_normalize_attention;
         chunked_attention=candidate_chunked_attention;
         parallel_values=candidate_parallel_values;

@@ -60,7 +60,8 @@
     "STRATA_DS41_VALUE_HEAD_PAIR": "1",
     "STRATA_DS41_WINDOW_HEAT": "1",
     "STRATA_DS41_OWNER_WEIGHTS": "1",
-    "STRATA_DS41_REGISTER_64M": "1"
+    "STRATA_DS41_REGISTER_64M": "1",
+    "STRATA_DS41_FFN_POST_FUSE": "1"
   },
   "sampling": {
     "temperature": 0,

@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N55 settings. From the checkout root, copy it to an ignored local file:
+N59 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -226,3 +226,27 @@ major faults; main plus two RAM lockers had zero swap at READY, and all
 host registration before READY; the 64 MiB option above allowed the full
 run to complete. N55 is adopted locally; N49 is retained. No new API
 checkpoint was run for N55; the 70 tok/s goal remains unmet.
+
+
+N59 enables `STRATA_DS41_FFN_POST_FUSE=1` for the original direct FFN graph
+with mirrored HC and CPU TP reduction. A separate CUDA operator combines
+routed/shared outputs and updates the owner's four residual streams while
+preserving the original route order, F32 intermediate rounding and HC FMA
+order. The other rank receives the same FFN payload and performs its own
+HC update. Original operators and the opt-out path are retained; CHECK uses
+the original serial operators as its reference. All original CPU F16C
+functions and numerical CUDA source remain unchanged.
+
+2026-10-23 N59: 4092 timed tokens / 66.4788 seconds = **61.5535 tok/s**,
+observed +0.0322% versus N55. Standard EN/JA:61.8710/65.4812; held-out
+EN/JA:55.3853/64.5385 tok/s. This tiny single-suite difference can be noise;
+it does not establish statistical significance. The local operator gate
+was 1.14954x for combine plus HC, which does not predict whole-model gains.
+The profile is adopted for its observed score and verified operator/launch
+reduction. All six output sequences and draft counts matched N55. Actual
+batch8/rollback CHECK max_abs and relative_rms were zero, model reads and
+major faults were zero in all cases, and main plus two lockers had zero
+swap at READY with all409.518GiB resident. Operator tests compared
+44,236,800 values bitwise on both GPUs with NT1..8, capture on/off, mixed
+CPU/GPU masks and in-place HC. No new N59 API checkpoint;70tok/s remains
+unmet. N55 and earlier records remain available locally.
