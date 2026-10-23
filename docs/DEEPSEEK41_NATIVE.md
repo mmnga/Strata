@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N75 settings. From the checkout root, copy it to an ignored local file:
+N78 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -373,3 +373,38 @@ processes had zero swap, and 409.518 GiB residency passed nine times.
 Original Q4_K_M, CPU F16C math, DSpark MXFP4, TP2/all40, lookahead2 and
 262144/F16 KV remain. No new API checkpoint; server stopped. The 70 tok/s
 goal is unmet. Changes and commits remain local; no push.
+
+
+N78 adds `STRATA_DS41_VALUE_ASYNC64=1`, requiring the adopted score-grid
+and paired-head attention options. It keeps two heads, 64 dimensions and
+64 threads per value CTA. Strata's asynchronous-copy commit/wait pattern
+stages two 64-by-64 F16 tiles, loading the next tile while the original
+row-ordered value FMAs consume the current tile. A wait and CTA barrier
+protect every read and buffer reuse; the final tile waits for all copies.
+The cache operator and raw F16 bits are retained. The QK and softmax
+expressions are copied unchanged into the new CUDA file; none of the six
+protected original CPU/CUDA math files changes. The extra 16 KiB is shared
+memory per CTA; global workspace, weights, KV storage and cache slots stay
+unchanged. The option defaults off; the adopted example enables it.
+
+The fixed long4 aggregate was **63.6465 tok/s**, 4092 timed tokens /
+64.2926 seconds, versus N75's 62.8825: observed **+1.2151%**. Standard
+English/Japanese measured 63.1353/68.6154 and held-out English/Japanese
+56.6223/67.6901 tok/s. All four were faster. Every prompt, generated ID
+sequence and DSpark count matched N75 across all six requests. This one
+changed-candidate suite does not establish statistical significance.
+
+On both GPUs, 35389440 candidate attention values matched the original
+full attention bitwise, including NT1..8, ratios0/1/2, ring wrap, full
+context positions, changed graph inputs, signed zero and F16 subnormals.
+The adopted paired baseline was checked on the same values. Another
+786432 paired gate values matched. The fixed NT3/head32/D512/ratio2/
+640-row complete QK/softmax/value fixture measured **1.39637x**, 16/16
+pairs faster. It excludes projections and index ranking and is not a
+whole-model gain. Actual-model batch8/rollback CHECK had max_abs=0 and
+relative_rms=0; all inference disk-read and major-fault deltas were zero.
+READY's three processes had zero swap, and 409.518 GiB residency passed
+nine times. Cache slots remained1225/846, reserve1536MiB per GPU.
+Original target Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math, lookahead2
+and262144/F16KV remain. Server stopped; no new API checkpoint. The70tok/s
+goal is unmet. All changes and commits remain local; no push.
