@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N112 settings. From the checkout root, copy it to an ignored local file:
+N118 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -823,7 +823,7 @@ CHECK max_abs=0 and relative_rms=0; all inference disk reads and major
 faults were zero, READY's3 processes had zero swap, and409.518GiB model
 residency passed9 times. Original Q4_K_M/F16C, DSpark MXFP4, TP2/all40,
 24 math threads, lookahead2 and262144/F16 KV remain. No push.
-The70 tok/s aggregate goal remains unmet; server stopped, no new API checkpoint.
+At N112 adoption the70 tok/s aggregate goal remained unmet; that server was stopped.
 
 
 N112 enables `STRATA_DS41_DSPARK_MARKOV_BF16=1`. Only DSpark's
@@ -871,4 +871,30 @@ sources/F16C remain unchanged. Actual-model CHECK max_abs=0 and relative_rms=0;
 all inference disk reads and major faults were zero, READY's3 processes
 had zero swap, and409.518GiB model residency passed9 times. Native TP2/all40,
 24 math threads, two-layer gate lookahead and262144/F16 KV remain. No push.
+The70 tok/s aggregate goal remains unmet; server stopped, no new API checkpoint.
+
+
+N118 enables `STRATA_DS41_MAIN_PRIORITY=1`. Only the target model's two
+Rank streams request the highest supported CUDA stream priority. Each
+device's range is queried and the resulting stream priority is verified
+at startup. The measured devices reported actual/greatest-5 and least0.
+The Draft Rank, auxiliary conditional captures, cache fills and cold
+expert streams keep their original priorities. The default is off and
+an unsupported or mismatched priority is rejected before inference.
+
+This is a compute scheduling hint: it does not prioritize copies or
+preempt work already running. All kernels, graph dependencies, numerical
+operators, cache capacities and CPU scheduling are retained. Performance
+was measured with the actual competing background streams, without an
+artificial priority workload or an unchanged throughput rerun.
+
+The fixed four-long aggregate measured **69.0718 tok/s**, 4092 timed tokens / 59.2427 seconds, versus N112's 69.0069: observed **+0.0940%**. Standard EN/JA and held-out EN/JA measured 67.5167, 75.7379, 60.5168, 74.7840 tok/s. All six output sequences and DSpark accepted/offered counts matched N112. This single candidate suite does not establish statistical significance.
+
+All80 existing GPU modules and all three original CPU archive members
+match N112 byte for byte. Original six math/F16C sources remain unchanged.
+Model CHECK max_abs=0 and relative_rms=0; inference disk reads and major
+faults were zero, READY's three processes had zero swap and409.518GiB
+residency passed nine times. Native TP2/all40,24 math participants,
+original Q4_K_M/MXFP4 DSpark,depth5/confidence.75,two-layer gate lookahead,
+262144/F16 KV and expert cache1225/846 remain. No push.
 The70 tok/s aggregate goal remains unmet; server stopped, no new API checkpoint.

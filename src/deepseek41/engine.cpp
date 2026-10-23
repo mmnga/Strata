@@ -106,7 +106,22 @@ struct Rank {
     bool graph_enabled = [] { const char* v = std::getenv("STRATA_DS41_GRAPHS"); return !v || std::atoi(v) != 0; }();
     bool wide_il = [] { const char* v=std::getenv("STRATA_DS41_WIDE_IL"); return v && std::atoi(v)!=0; }();
     std::vector<std::unique_ptr<Buffer>> raw, compressed, keys, projections, pool_scores, selected;
-    explicit Rank(int d,int r,int n) : id(d),rank(r),count(n) { ck(cudaSetDevice(id)); ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking)); }
+    explicit Rank(int d,int r,int n,bool target_stream=true) : id(d),rank(r),count(n) {
+        ck(cudaSetDevice(id));
+        const char* setting=std::getenv("STRATA_DS41_MAIN_PRIORITY");
+        if(target_stream&&setting&&std::atoi(setting)!=0){
+            int least=0,greatest=0;ck(cudaDeviceGetStreamPriorityRange(&least,&greatest));
+            if(greatest>=least)throw std::runtime_error("native target stream priority unsupported");
+            ck(cudaStreamCreateWithPriority(&stream,cudaStreamNonBlocking,greatest));
+            int actual=0;const auto result=cudaStreamGetPriority(stream,&actual);
+            if(result!=cudaSuccess||actual!=greatest){
+                cudaStreamDestroy(stream);stream=nullptr;
+                if(result!=cudaSuccess)ck(result);
+                throw std::runtime_error("native target stream priority mismatch");
+            }
+            std::fprintf(stderr,"strata-deepseek41: target main stream priority device=%d actual=%d greatest=%d least=%d; background and Draft priorities unchanged\n",id,actual,greatest,least);
+        }else ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+    }
     ~Rank() { cudaSetDevice(id); cudaStreamSynchronize(stream); graphs.clear(); matrices.clear(); buffers.clear(); raw.clear(); compressed.clear(); keys.clear(); projections.clear(); pool_scores.clear(); selected.clear(); cudaStreamDestroy(stream); }
     template<class F> void launch(int layer,int phase,int tokens,F&& body) {
         if (!graph_enabled) { body(); return; }
@@ -1223,7 +1238,7 @@ public:
     std::vector<std::unique_ptr<DraftCaptureStream>> head_streams;
     Host<int32_t> proposals{Batch};
     Host<float> confidence{Batch};
-    Draft(const std::string& path,Engine& target) : file(path),c(target.c),rank(target.ranks.back()->id,0,1) {
+    Draft(const std::string& path,Engine& target) : file(path),c(target.c),rank(target.ranks.back()->id,0,1,false) {
         auto integer = [&](const std::string& key) {
             const auto* value = file.get(key); if (!value || !value->is_num() || value->u > INT32_MAX) throw std::runtime_error("DSpark missing/invalid "+key); return int(value->u);
         };
