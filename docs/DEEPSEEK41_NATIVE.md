@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N69 settings. From the checkout root, copy it to an ignored local file:
+N71 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -319,3 +319,26 @@ for every case; all three processes had zero swap at READY. The original
 establish statistical significance. No new API checkpoint was run;
 the server is stopped and the 70 tok/s goal remains unmet. Changes are
 local; no push was performed.
+
+
+N71 adds `STRATA_DS41_DSPARK_CONDITIONAL_HEAD=1`. It requires a CUDA 13.0+
+build, graph replay and the existing positive confidence threshold. The
+option defaults off; older CUDA builds retain the original path. On the
+two RTX5090 GPUs, nested conditional graph capture passed every prefix
+and threshold boundary. Full head comparisons preserve emitted token IDs,
+confidence and logits bitwise; unreturned rows are skipped. The original
+five-position noise block, all five Q6_K base logits, Markov matrices,
+threshold0.75 and first-always-offer policy are retained. Conditional
+nodes omit later Markov projections and sampling once that same policy
+has stopped the prefix. Original target and CPU F16C arithmetic are unchanged.
+
+The fixed long4 score was **62.5436 tok/s**, 4092 tokens /65.4264s, versus
+N69's62.3569, observed **+0.2994%**. Both long English cases were slower;
+both Japanese cases were faster. All six output ID sequences and draft
+counts match N69. Batch8/rollback CHECK max_abs=0/relative_rms=0; all
+inference disk reads and major faults were zero, READY's three processes
+had zero swap, and409.518GiB residency passed. The local two-emitted-prefix
+Markov-head fixture measured2.22529x (16/16 balanced pairs faster), which
+is not a whole-model gain. The small observed long4 difference may be
+noise; no statistical claim. No new API checkpoint was run; server stopped,
+70tok/s unmet, local changes only and no push.

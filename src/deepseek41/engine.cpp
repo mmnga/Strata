@@ -1,4 +1,5 @@
 #include "strata/deepseek41/engine.hpp"
+#include "strata/deepseek41/dspark_head.hpp"
 #include "strata/deepseek41/model.hpp"
 #include "strata/deepseek41/resident.hpp"
 #include "strata/deepseek41/cpu_experts.hpp"
@@ -60,6 +61,11 @@ struct Buffer {
     float* f(size_t off = 0) const { return static_cast<float*>(p)+off; }
     int32_t* i() const { return static_cast<int32_t*>(p); }
     uint16_t* h() const { return static_cast<uint16_t*>(p); }
+};
+struct DraftCaptureStream {
+    int device;cudaStream_t stream{};
+    explicit DraftCaptureStream(int d):device(d){ck(cudaSetDevice(d));ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));}
+    ~DraftCaptureStream(){cudaSetDevice(device);cudaStreamDestroy(stream);}
 };
 template<class T> struct Host {
     T* p = nullptr; size_t n;
@@ -1009,6 +1015,8 @@ public:
     bool mxfp4_alu = [] { const char* v=std::getenv("STRATA_DS41_MXFP4_ALU"); return v && std::atoi(v)!=0; }();
     bool mxfp4_pipe = [] { const char* v=std::getenv("STRATA_DS41_MXFP4_PIPE4"); return v && std::atoi(v)!=0; }();
     float min_confidence = [] { const char* v=std::getenv("STRATA_DS41_DSPARK_P_MIN"); return v ? std::stof(v) : 0.0f; }();
+    bool conditional_head=[] {const char* v=std::getenv("STRATA_DS41_DSPARK_CONDITIONAL_HEAD");return v && std::atoi(v)!=0;}();
+    std::vector<std::unique_ptr<DraftCaptureStream>> head_streams;
     Host<int32_t> proposals{Batch};
     Host<float> confidence{Batch};
     Draft(const std::string& path,Engine& target) : file(path),c(target.c),rank(target.ranks.back()->id,0,1) {
@@ -1032,6 +1040,8 @@ public:
         block_size = integer("dflash.block_size"); mask = integer("tokenizer.ggml.mask_token_id");
         context_limit = target.context;
         if (!std::isfinite(min_confidence) || min_confidence<0 || min_confidence>1) throw std::runtime_error("DSpark confidence threshold must be 0..1");
+        if(conditional_head && (!C::conditional_draft_available() || !replay || !rank.graph_enabled || min_confidence<=0))
+            throw std::runtime_error("conditional DSpark head requires CUDA13, graph replay and original confidence policy");
         if (block_size < 1 || block_size >= Batch || mask < 0 || mask >= c.vocab) throw std::runtime_error("DSpark noise block geometry");
         ck(cudaSetDevice(rank.id)); uint64_t bytes = 0;
         for (const auto& tensor : file.tensors()) {
@@ -1051,6 +1061,13 @@ public:
         }
         if (mxfp4_pipe && (c.hidden%128 || c.expert_ff%128)) throw std::runtime_error("DSpark pipelined MXFP4 requires original 128-aligned widths");
         std::fprintf(stderr,"strata-deepseek41: DSpark original MXFP4 four-block operand pipeline=%d\n",mxfp4_pipe ? 1 : 0);
+        if(conditional_head){
+            const auto& w1=rank.w("markov_w1.weight");const auto& w2=rank.w("markov_w2.weight");
+            if(w1.type!=0 || w2.type!=0 || w1.in!=256 || w2.in!=256 || w1.out!=c.vocab || w2.out!=c.vocab)
+                throw std::runtime_error("conditional DSpark head requires original BF16-expanded F32 Markov matrices");
+            for(int t=0;t<5;++t)head_streams.push_back(std::make_unique<DraftCaptureStream>(rank.id));
+        }
+        std::fprintf(stderr,"strata-deepseek41: original DSpark conditional Markov prefix=%d\n",conditional_head ? 1 : 0);
         allocate();
         if (replay) {
             // Initialize the existing sampler's per-device capability cache
@@ -1192,6 +1209,15 @@ public:
         ck(cudaMemcpyAsync(r.buffer("position",4).p,positions,size_t(n)*4,cudaMemcpyHostToDevice,r.stream));
         auto body=[&] {
             noise_decode(n);
+            if(conditional_head){
+                const auto confidence_bias=r.matrices.find("conf_proj.bias");
+                C::DraftHeadView view{r.f("x",H),r.weight("markov_w1.weight"),r.weight("markov_w2.weight"),r.weight("conf_proj.weight"),
+                    confidence_bias==r.matrices.end() ? nullptr : confidence_bias->second.storage->f(),
+                    r.buffer("token",4).i(),r.f("logits",c.vocab),r.f("markov",256),r.f("bias",c.vocab),r.f("confidence",1),r.buffer("pick",4).i(),H,c.vocab};
+                void* bodies[5];for(int t=0;t<5;++t)bodies[t]=head_streams[t]->stream;
+                C::conditional_draft_head(view,n,min_confidence,r.stream,bodies);
+                return;
+            }
             const auto& w1=r.w("markov_w1.weight");
             K::SamplerParams params; params.greedy=true; params.temperature=0;
             for (int t=0;t<n;++t) {
