@@ -3,6 +3,7 @@
 #include "strata/deepseek41/draft_output.hpp"
 #include "strata/deepseek41/hc_coeff.hpp"
 #include "strata/deepseek41/hc_coeff_pre.hpp"
+#include "strata/deepseek41/kv_norm_rope.hpp"
 #include "strata/deepseek41/index_rank.hpp"
 #include "strata/deepseek41/attention_async.hpp"
 #include "strata/deepseek41/norm_quant.hpp"
@@ -232,6 +233,7 @@ public:
     bool norm_q8_first=[] {const char* v=std::getenv("STRATA_DS41_NORM_Q8_FIRST");return v&&std::atoi(v)!=0;}();
     bool query_reuse=[] {const char* v=std::getenv("STRATA_DS41_QUERY_REUSE");return v&&std::atoi(v)!=0;}();
     bool qk_pair_keys=[] {const char* v=std::getenv("STRATA_DS41_QK_PAIR_KEYS");return v&&std::atoi(v)!=0;}();
+    bool kv_norm_rope=[] {const char* v=std::getenv("STRATA_DS41_KV_NORM_ROPE");return v&&std::atoi(v)!=0;}();
     std::vector<int> query_capacity;
     bool value_async=[] {const char* v=std::getenv("STRATA_DS41_VALUE_ASYNC64");return v&&std::atoi(v)!=0;}();
     bool index_rank_batch=[] {const char* v=std::getenv("STRATA_DS41_INDEX_RANK_BATCH");return v&&std::atoi(v)!=0;}();
@@ -344,6 +346,14 @@ public:
         std::fprintf(stderr,"strata-deepseek41: exact batched index ranking=%d; original stable score order\n",index_rank_batch ? 1 : 0);
         if(value_async && (!score_grid || !value_head_pair))throw std::runtime_error("async value staging requires original score-grid and paired-head path");
         std::fprintf(stderr,"strata-deepseek41: original paired attention values async64=%d; sequential FMA unchanged\n",value_async ? 1 : 0);
+        if(kv_norm_rope){
+            if(!attention_replay || c.hidden!=5120 || c.head_dim!=512 || c.rope_dim!=64 || c.sliding_window!=128)
+                throw std::runtime_error("fused KV preparation requires original replay/D512/rot64/window128");
+            for(auto& rp:ranks)for(int l=0;l<c.layers;++l){const auto p=block(l);const auto& kv=rp->w(p+"attn_kv.weight");const auto& norm=rp->w(p+"attn_kv_a_norm.weight");
+                if(kv.type!=12 || kv.in!=5120 || kv.out!=512 || norm.type!=0 || norm.in!=512)
+                    throw std::runtime_error("fused KV preparation requires original KV/norm matrices");}
+        }
+        std::fprintf(stderr,"strata-deepseek41: original KV RMS/RoPE/F16 publication fused=%d\n",kv_norm_rope ? 1 : 0);
         if(qk_pair_keys && !query_reuse)throw std::runtime_error("paired QK keys require adopted query-reuse attention");
         std::fprintf(stderr,"strata-deepseek41: original adjacent QK heads share key decode=%d\n",qk_pair_keys ? 1 : 0);
         query_capacity.assign(ranks.size(),0);
@@ -527,9 +537,9 @@ public:
         }
         r.norm(p+"attn_q_a_norm.weight",qr,qr,c.q_rank,float(c.rms_eps),tokens);
         r.mat(p+"attn_q_b.weight",qr,r.f("q",D*A),tokens); r.mat(p+"attn_kv.weight",x,r.f("kv",D),tokens);
-        r.norm(p+"attn_kv_a_norm.weight",r.f("kv",D),r.f("kv",D),D,float(c.rms_eps),tokens);
+        if(!kv_norm_rope) r.norm(p+"attn_kv_a_norm.weight",r.f("kv",D),r.f("kv",D),D,float(c.rms_eps),tokens);
         C::rope(r.f("q",D*A),D,A,tokens,r.buffer("position",4).i(),rope_config(layer),false,r.stream);
-        C::rope(r.f("kv",D),D,1,tokens,r.buffer("position",4).i(),rope_config(layer),false,r.stream);
+        if(!kv_norm_rope) C::rope(r.f("kv",D),D,1,tokens,r.buffer("position",4).i(),rope_config(layer),false,r.stream);
         if (ratio && streams.publishes_kv) {
             r.mat(p+"attn_compressor_kv.weight",x,r.f("compress_values",D),tokens);
             if (ratio > 1) r.mat(p+"attn_compressor_gate.weight",x,r.f("compress_scores",D),tokens);
@@ -579,7 +589,9 @@ public:
         const auto* pos=r.buffers.at("position")->i();
         const auto* comp_pos=r.buffers.at(ratio==2 ? "compress_position_2" : "position")->i();
         attention_prepare(r,layer,tokens);
-        C::store_f16_positions(r.f("kv",D),r.raw[layer]->h(),D,tokens,pos,c.sliding_window+Batch,0,r.stream);
+        if(kv_norm_rope) C::kv_norm_rope_store(r.f("kv",D),r.weight(p+"attn_kv_a_norm.weight"),r.raw[layer]->h(),pos,
+            D,tokens,rope_config(layer),c.sliding_window+Batch,float(c.rms_eps),r.stream);
+        else C::store_f16_positions(r.f("kv",D),r.raw[layer]->h(),D,tokens,pos,c.sliding_window+Batch,0,r.stream);
         if (ratio && streams.publishes_kv) {
             C::projection_ring(r.f("compress_values",D),ratio > 1 ? r.f("compress_scores",D) : nullptr,
                 r.projections[layer]->f(),ratio > 1 ? r.pool_scores[layer]->f() : nullptr,D,tokens,pos,Batch*2,r.stream);
@@ -1060,6 +1072,7 @@ public:
         const bool candidate_hc_coeff_pre=hc_coeff_pre; hc_coeff_pre=false;
         const bool candidate_query_reuse=query_reuse; query_reuse=false;
         const bool candidate_qk_pair_keys=qk_pair_keys; qk_pair_keys=false;
+        const bool candidate_kv_norm_rope=kv_norm_rope; kv_norm_rope=false;
         const bool candidate_value_async=value_async; value_async=false;
         const bool candidate_index_rank_batch=index_rank_batch; index_rank_batch=false;
         const bool candidate_score_grid=score_grid; score_grid=false;
@@ -1100,6 +1113,7 @@ public:
         hc_coeff_pre=candidate_hc_coeff_pre;
         query_reuse=candidate_query_reuse;
         qk_pair_keys=candidate_qk_pair_keys;
+        kv_norm_rope=candidate_kv_norm_rope;
         value_async=candidate_value_async;
         index_rank_batch=candidate_index_rank_batch;
         normalize_attention=candidate_normalize_attention;

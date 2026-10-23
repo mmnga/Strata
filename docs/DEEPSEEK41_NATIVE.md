@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N94 settings. From the checkout root, copy it to an ignored local file:
+N96 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -737,3 +737,46 @@ had zero swap, and409.518GiB residency passed nine times. Cache slots
 stayed1225/846. Original Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math,
 lookahead2 and262144/F16KV remain.70tok/s is unmet; server stopped,
 no new API checkpoint. No push.
+
+
+N96 adds `STRATA_DS41_KV_NORM_ROPE=1` for the target's original512-wide
+KV vector. One256-thread CTA per token performs the original RMS, last64
+adjacent-pair RoPE and F16 raw-ring publication. The original256-lane sum
+tree, runtime divisor, two rounded normalization products, precise YaRN
+trigonometry and F16 conversion remain. Shared memory holds the normalized
+512 floats until rotation; the operation writes both the original rotated
+F32 vector and the original F16 cache bits. No global workspace is added.
+
+The two preparation calls are deferred from attention preparation to the
+original raw-store point and performed there by the new operator. Intervening
+compressor/indexer projections consume x or qr, so do not need this KV
+vector. The graph still completes raw publication before attention reads it.
+Query RoPE, compressed KV, indexer and DSpark retain their paths. The flag
+requires attention replay and the original H5120/D512/rot64/window128 plus
+all original KV/norm matrix shapes and types. The default is off and the
+example enables it. Serial CHECK clears it for the reference.
+
+The fixed four-long aggregate measured **68.5252 tok/s**,4092 timed tokens /
+59.7153 seconds, versus N94's68.3706: observed **+0.2261%**. Standard
+English/Japanese measured67.1432/74.9187 and held-out English/Japanese
+60.1651/74.0167 tok/s; all four were faster. All six prompt/output ID
+sequences and DSpark accepted/offered counts matched N94. This small
+change in one candidate suite may include noise; it does not establish
+statistical significance.
+
+The two-GPU oracle matched4314624 rotated F32 values and265297920 F16
+raw-ring bytes. NT1..8, plain and actual YaRN settings, null gamma, nine
+starts and three changed captures covered wrap, full context and zero
+inputs. Direct KV controls also exercised F32 subnormal and near-normal
+values that the unchanged projection quantizer can otherwise flush. The
+complete input-quant/Q4K5120x512/RMS/RoPE/store gate used137 cold matrices,
+202014720 bytes, greater than twice L2 (201326592 bytes). Every actual
+matrix pointer, fused256-thread launch and bank's F32/F16 outputs were
+checked. Fixed NT3 measured1.12168x with16/16 balanced pairs faster, five
+versus three kernels. This is a component result. Actual-model batch8/
+rollback CHECK had max_abs=0 and relative_rms=0. All inference disk reads
+and major faults were zero, READY's three processes had zero swap, and
+409.518GiB residency passed nine times. Cache slots stayed1225/846.
+Original Q4_K_M/F16C, DSpark MXFP4, TP2/all40,24math, lookahead2 and
+262144/F16KV remain.70tok/s is unmet; server stopped, no new API checkpoint.
+No push.
