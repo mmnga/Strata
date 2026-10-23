@@ -1,4 +1,5 @@
 #include "strata/deepseek41/engine.hpp"
+#include "strata/deepseek41/engram_tp.hpp"
 #include "strata/deepseek41/head_pick.hpp"
 #include "strata/deepseek41/markov_bf16.hpp"
 #include "strata/deepseek41/dspark_head.hpp"
@@ -273,6 +274,8 @@ public:
     Host<int32_t> group_start, group_dst, group_tok, group_count;
     std::vector<int32_t> history;
     std::vector<float> engram_input;
+    bool engram_tp_enabled=[] {const char*v=std::getenv("STRATA_DS41_ENGRAM_TP");return v&&std::atoi(v)!=0;}();
+    std::unique_ptr<Host<float>> engram_tp_rows;
     int position = 0, context, last_rows = 1;
     bool speculative = false;
     bool attention_replay = [] { const char* v = std::getenv("STRATA_DS41_ATTENTION_GRAPH"); return v && std::atoi(v) != 0; }();
@@ -418,6 +421,21 @@ public:
     }
     void abort_tp() { *static_cast<volatile uint32_t*>(tp_abort.p)=1; std::atomic_thread_fence(std::memory_order_release); }
     ~Engine() { abort_tp(); streamed.reset(); lookahead.reset(); expert_cache.reset(); ranks.clear(); K::cpu::restore_thread_affinity(affinity); }
+    void enable_engram_tp(){
+        if(!engram_tp_enabled)return;
+        if(ranks.size()!=2||c.hidden!=5120||c.hc!=4||c.engram.buckets()*size_t(c.engram.head_dim)!=6144)
+            throw std::runtime_error("Engram TP requires original TP2/H5120/6144 input");
+        for(auto layer:c.engram.layers){const auto p=block(int(layer));
+            for(auto&rp:ranks){const auto&m=rp->w(p+"engram_wkv.weight");const auto&q=rp->w(p+"engram_q.weight");const auto&k=rp->w(p+"engram_k.weight");
+                if(m.type!=12||m.in!=6144||m.out!=25600||m.storage->bytes!=88473600||q.type!=0||k.type!=0||q.in!=5120||k.in!=5120||q.out!=4||k.out!=4)
+                    throw std::runtime_error("Engram TP original WKV/Q/K geometry");
+            }
+            const auto q=model.tensor(p+"engram_q.weight"),k=model.tensor(p+"engram_k.weight");
+            if(q.tensor->type!=30||k.tensor->type!=30)throw std::runtime_error("Engram TP requires original BF16 Q/K sources");
+        }
+        engram_tp_rows=std::make_unique<Host<float>>(size_t(2)*engram_tp::Half*Batch);
+        std::fprintf(stderr,"strata-deepseek41: Engram original Q4K WKV TP2=1; 12800 rows/rank, 819200 pinned stage bytes; original GPU buffers/cache unchanged\n");
+    }
     void enable_attention_values() {
         if(!parallel_values) return;
         for(auto& rp:ranks) {ck(cudaSetDevice(rp->id));rp->buffer("attention_values",size_t(c.heads/rp->count)*640*12);}
@@ -788,6 +806,16 @@ public:
                 for (int b = 0; b < c.engram.head_dim/256; ++b) dequantize_q4_K(data+size_t(ids[j])*row_bytes+size_t(b)*144,engram_input.data()+size_t(t)*width+j*c.engram.head_dim+b*256);
             }
         }
+        if(engram_tp_enabled){
+            if(!engram_tp_rows)throw std::runtime_error("Engram TP stage not prepared");
+            engram_tp::View views[2];
+            for(int rank=0;rank<2;++rank){auto&r=*ranks[rank];const auto&m=r.w(p+"engram_wkv.weight");
+                views[rank]={r.id,r.stream,static_cast<const uint8_t*>(m.storage->p),r.f("engram_input",width),r.f("engram_kv",c.hidden*5),
+                    r.f("residual",c.hidden*4),r.weight(p+"engram_q.weight"),r.weight(p+"engram_k.weight"),r.buffers.at("q8")->p,r.buffers.at("q8_il")->p,r.wide_il};
+            }
+            engram_tp::enqueue(views,engram_input.data(),engram_tp_rows->p,tokens,float(c.rms_eps));
+            return;
+        }
         for (auto& rp : ranks) {
             auto& r = *rp; ck(cudaSetDevice(r.id));
             ck(cudaMemcpyAsync(r.f("engram_input",engram_input.size()),engram_input.data(),engram_input.size()*4,cudaMemcpyHostToDevice,r.stream));
@@ -1122,6 +1150,7 @@ public:
             auto& r = *ranks[0]; ck(cudaSetDevice(r.id)); std::vector<float> out(size_t(last_rows)*c.vocab);
             ck(cudaMemcpy(out.data(),r.f("logits",c.vocab),out.size()*4,cudaMemcpyDeviceToHost)); return out;
         };
+        const bool candidate_engram_tp=engram_tp_enabled;engram_tp_enabled=false;
         const bool candidate_attention = attention_replay; attention_replay = false;
         const bool candidate_hc_owner=hc_owner; hc_owner=false;
         const bool candidate_direct_ffn=direct_ffn; direct_ffn=false;
@@ -1168,6 +1197,7 @@ public:
         }
         prefill(); std::vector<float> expected;
         for (int t = 0; t < Batch; ++t) { step(inputs[prefix+size_t(t)]); auto row = host_logits(); expected.insert(expected.end(),row.begin(),row.end()); }
+        engram_tp_enabled=candidate_engram_tp;
         attention_replay = candidate_attention;
         hc_owner=candidate_hc_owner;
         direct_ffn=candidate_direct_ffn;
@@ -1686,6 +1716,7 @@ int run(int argc,char** argv) {
         engine.enable_streamed();
         engine.enable_chunked_attention();
         engine.enable_attention_values();
+        engine.enable_engram_tp();
         if(draft)draft->lend_greedy_head(engine);
         if(draft)draft->prepare_markov_bf16();
         else if(engine.greedy_head_tp)throw std::runtime_error("greedy TP head requires original DSpark copy");

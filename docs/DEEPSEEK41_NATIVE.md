@@ -29,7 +29,7 @@ the default path when the DeepSeek build option is off.
 ## Run the adopted configuration
 
 [The server example](../examples/deepseek41-server.json) contains the adopted
-N118 settings. From the checkout root, copy it to an ignored local file:
+N120 settings. From the checkout root, copy it to an ignored local file:
 
 ```sh
 cp examples/deepseek41-server.json strata-deepseek41.json
@@ -871,7 +871,7 @@ sources/F16C remain unchanged. Actual-model CHECK max_abs=0 and relative_rms=0;
 all inference disk reads and major faults were zero, READY's3 processes
 had zero swap, and409.518GiB model residency passed9 times. Native TP2/all40,
 24 math threads, two-layer gate lookahead and262144/F16 KV remain. No push.
-The70 tok/s aggregate goal remains unmet; server stopped, no new API checkpoint.
+At N118 adoption the70 tok/s aggregate goal remained unmet; that server was stopped.
 
 
 N118 enables `STRATA_DS41_MAIN_PRIORITY=1`. Only the target model's two
@@ -897,4 +897,50 @@ faults were zero, READY's three processes had zero swap and409.518GiB
 residency passed nine times. Native TP2/all40,24 math participants,
 original Q4_K_M/MXFP4 DSpark,depth5/confidence.75,two-layer gate lookahead,
 262144/F16 KV and expert cache1225/846 remain. No push.
+The70 tok/s aggregate goal remains unmet; server stopped, no new API checkpoint.
+
+
+N120 enables `STRATA_DS41_ENGRAM_TP=1`. Both ranks retain their existing
+full original Q4_K Engram WKV matrices. Each computes12800 of25600 output
+rows, using the existing plain/IL/wide kernels and original6144 input
+columns. The two exact F32 halves are concatenated before the original
+Engram update runs on both ranks. No numerical reduction joins the ranks.
+
+The default is off. It requires TP2, H5120,24 Engram buckets of256 and
+original Q4_K WKV shape6144x25600 with original BF16 query/key matrices.
+A819200-byte pinned host stage is allocated after cache sizing. Compact
+halves use the existing GPU KV buffers, copy to the host, then both local
+and remote halves copy back using2D transfers. No P2P or new GPU math,
+weight buffers or repacking is used. Local roundtrip cost is included.
+Original CPU hash/table lookup/dequantization and pageable input transfer
+remain. Intervening attention TP fences protect stage reuse; Rank streams
+drain before stage destruction. CHECK clears/restores the option around
+its independent original reference. Cache slots remain1225/846.
+
+The fixed four-long aggregate measured **69.1424 tok/s**, 4092 timed tokens / 59.1822 seconds, versus N118's 69.0718: observed **+0.1022%**. Standard EN/JA and held-out EN/JA measured 67.6051, 75.7593, 60.6061, 74.8496 tok/s. All six output sequences and DSpark accepted/offered counts matched N118. One candidate suite does not establish statistical significance.
+
+The complete two-GPU WKV consumer measured1.060839x,16/16 balanced pairs
+faster: pageable input transfers, quantization, projection, half-result
+transfers and drains, host allgather, original Engram update and final
+drains, plus common residual resets and all runtime calls. CPU table
+lookup/dequantization is unchanged outside that scope. Fixed NT3 uses
+five disjoint banks:442368000 full-weight bytes and221184000 bytes per
+rank's halves, both beyond twice L2. The synthetic epsilon was1e-6;
+actual model epsilon1e-20 was tested in separate numerical controls.
+This is a component result, not a model hit rate or a model speedup claim.
+
+Both GPUs matched25437888 F32 values using both original actual WKV and
+BF16 query/key tensors at the model's epsilon: NT1..8, three changed input
+phases, zero/signed zero/subnormal/extreme values, full WKV and residuals,
+gates, Q81/IL bytes and guards. Captured partial-projection replays match
+the corresponding original full rows, with actual matrix/half-offset and
+quantization pointers verified. All80 existing GPU modules and all three
+original CPU objects match N118 byte for byte; the host helper matches
+the measured source. Original six math/F16C sources remain unchanged.
+
+Model CHECK max_abs=0 and relative_rms=0; inference disk reads and major
+faults were zero, READY's three processes had zero swap and409.518GiB
+residency passed nine times. Native TP2/all40,24 math participants,
+original Q4_K_M/MXFP4 DSpark,depth5/confidence.75,two-layer gate lookahead,
+262144/F16 KV and reserve1536MiB remain. No push.
 The70 tok/s aggregate goal remains unmet; server stopped, no new API checkpoint.
